@@ -1,0 +1,44 @@
+# Основные зависимости для мониторинга криптовалют
+aiohttp==3.9.1
+websockets==12.0
+requests==2.31.0
+python-dotenv==1.0.0
+
+# Telegram и социальные сети
+telethon==1.34.0
+discord.py==2.3.2
+googletrans==4.0.0rc1
+
+# Веб-скрапинг и браузер
+playwright==1.40.0
+beautifulsoup4==4.12.2
+selenium==4.15.2
+
+# Анализ данных и ML
+numpy>=1.26.0
+pandas>=2.1.0
+scikit-learn>=1.3.0
+textblob==0.17.1
+openai==0.28.1
+
+# Логирование и утилиты
+colorlog==6.8.0
+python-dateutil==2.8.2
+pytz==2023.3
+
+# Twitter API (заблокирован)
+tweepy==4.14.0
+# snscrape==0.7.0.20230622  # Twitter API заблокирован, используем Nitter RSS
+
+# Криптовалютные API
+ccxt==4.1.77
+web3==6.11.3
+
+# Дополнительные утилиты
+psutil==5.9.6
+aiofiles==23.2.1
+
+# Тестирование
+pytest==7.4.3
+pytest-asyncio>=0.21.0
+pytest-xdist>=3.0.0 

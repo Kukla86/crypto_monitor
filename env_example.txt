@@ -1,0 +1,105 @@
+# ========================================
+# КОНФИГУРАЦИЯ СИСТЕМЫ МОНИТОРИНГА КРИПТОВАЛЮТ
+# ========================================
+
+# === ОКРУЖЕНИЕ ===
+ENVIRONMENT=development  # development/production
+
+# === API КЛЮЧИ ===
+# Etherscan API для мониторинга Ethereum
+ETHERSCAN_API_KEY=your_etherscan_api_key_here
+
+# Telegram Bot для отправки алертов
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+
+# OpenAI API для AI анализа (опционально)
+OPENAI_API_KEY=your_openai_api_key_here
+
+# === СОЦИАЛЬНЫЕ СЕТИ (опционально) ===
+# Telegram API для мониторинга каналов
+TELEGRAM_API_ID=your_telegram_api_id_here
+TELEGRAM_API_HASH=your_telegram_api_hash_here
+TELEGRAM_PHONE=your_telegram_phone_here
+
+# Discord Bot для мониторинга серверов
+DISCORD_BOT_TOKEN=your_discord_bot_token_here
+
+# === НАСТРОЙКИ МОНИТОРИНГА ===
+# Интервал проверки в секундах (минимум 10)
+CHECK_INTERVAL=60
+
+# Количество топ-холдеров для отслеживания
+TOP_HOLDERS_COUNT=10
+
+# Пороги для уведомлений
+NOTIFICATION_THRESHOLD=500000  # USD
+PRICE_CHANGE_THRESHOLD=10      # %
+VOLUME_CHANGE_THRESHOLD=50     # %
+TVL_CHANGE_THRESHOLD=20        # %
+HOLDERS_CHANGE_THRESHOLD=5     # количество
+
+# Включение/выключение функций
+WEBSOCKET_ENABLED=true
+REAL_TIME_ALERTS=true
+
+# === WHALE TRACKER ===
+WHALE_TRACKER_ENABLED=true
+WHALE_TRACKER_INTERVAL=30      # минуты
+
+# === RETRY И TIMEOUT НАСТРОЙКИ ===
+MAX_RETRIES=3
+RETRY_DELAY=1.0
+BACKOFF_FACTOR=2.0
+TIMEOUT=10.0
+
+# === RATE LIMITING ===
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+SOLANA_RATE_LIMIT=5
+
+# === СОЦИАЛЬНЫЙ МОНИТОРИНГ ===
+SOCIAL_FETCH_INTERVAL=900      # 15 минут
+TRANSLATE_TO=en                # язык перевода
+
+# === ЛОГИРОВАНИЕ ===
+LOG_LEVEL=INFO                 # DEBUG/INFO/WARNING/ERROR/CRITICAL
+LOG_MAX_SIZE_MB=10
+LOG_BACKUP_COUNT=5
+
+# === БАЗА ДАННЫХ ===
+DB_PATH=crypto_monitor.db
+DB_BACKUP_ENABLED=true
+DB_BACKUP_INTERVAL_HOURS=24
+
+# ========================================
+# ИНСТРУКЦИИ ПО НАСТРОЙКЕ
+# ========================================
+
+# 1. Скопируйте этот файл в config.env
+# 2. Замените все значения "your_*_here" на реальные ключи
+# 3. Обязательные переменные:
+#    - ETHERSCAN_API_KEY
+#    - TELEGRAM_BOT_TOKEN  
+#    - TELEGRAM_CHAT_ID
+# 4. Опциональные переменные можно оставить пустыми или удалить
+# 5. Для продакшена установите ENVIRONMENT=production
+
+# ========================================
+# ПОЛУЧЕНИЕ API КЛЮЧЕЙ
+# ========================================
+
+# Etherscan API:
+# 1. Зарегистрируйтесь на https://etherscan.io
+# 2. Перейдите в API-KEYs
+# 3. Создайте новый API ключ
+
+# Telegram Bot:
+# 1. Напишите @BotFather в Telegram
+# 2. Создайте нового бота: /newbot
+# 3. Получите токен бота
+# 4. Добавьте бота в чат и получите chat_id
+
+# OpenAI API:
+# 1. Зарегистрируйтесь на https://platform.openai.com
+# 2. Создайте API ключ в разделе API Keys
+# 3. Добавьте ключ в переменную OPENAI_API_KEY 

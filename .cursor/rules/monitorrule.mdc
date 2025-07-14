@@ -1,0 +1,55 @@
+---
+description: |
+  Generate a single-file Python monitoring script (`monitor.py`) with clear modular functions,
+  not separate scripts per source. Use functional style, full imports, PEP8, concise and testable.
+alwaysApply: true
+---
+
+## 🧠 High-Level Requirements
+
+- Create **one** entrypoint `monitor.py` that imports helper functions, not multiple standalone files.
+- Use **modular functions**: `check_onchain()`, `check_cex()`, `check_dex()`, `check_social()`, `check_analytics()`, `send_alerts()`.
+- Leverage **asyncio tasks** with scheduled intervals in one loop.
+- Code must include **all imports**, work out-of-the-box (after installing dependencies).
+- Avoid classes; use `def`/`async def` + helper modules inside one file.
+- Variable/function naming: `snake_case`, descriptive, no abbreviations without context.
+- Follow **PEP8** (line length ≤ 88, spaces around operators, proper indentation).
+- Twitter scraping alternative: use `twint` or `playwright` instead of official API.
+- Respect rate limits and use try/except with logging for network calls.
+
+## ✅ Project Structure Inside monitor.py
+
+1. **Imports**: asyncio, requests, aiohttp, telethon, browser (for scraping), sqlite3, json, os, dotenv.
+2. `.env` loading and `tokens.json` parsing.
+3. Functions:
+   - `async def check_onchain(session):`
+   - `async def check_cex(session):`
+   - `async def check_dex(session):`
+   - `async def check_social():`
+   - `async def check_analytics(session):`
+   - `def send_alert(level, message):`
+4. `async def main()`: schedule these tasks with `asyncio.gather` & `asyncio.sleep(interval)` loops.
+5. `if __name__ == "__main__": asyncio.run(main())`
+
+## 🛠 Functional Requirements
+
+- **Onchain**: Etherscan and Solana RPC for token transfers and liquidity pools.
+- **CEX**: Binance & Bybit REST + WebSocket for price/volume.
+- **DEX**: DefiLlama (TVL), Dexscreener (volume, price change), GeckoTerminal (via HTTP).
+- **Analytics**: DeBank, Arkham tags, BubbleMaps URL fetch.
+- **Social**: Twitter (scraping), Telegram (Telethon), Discord (discord.py).
+- **Alerts**: Telegram bot integration (`TELEGRAM_TOKEN`, `CHAT_ID`), SQLite logging.
+
+## 🧪 Quality and Maintainability
+
+- Include **docstrings** for each function.
+- Wrap network calls with `try/except` and log failures.
+- Use `.env` for credentials and `tokens.json` for token config.
+- Provide fallback behaviors and defaults.
+- All code in monitor.py, no external scripts.
+
+------
+description:
+globs:
+alwaysApply: false
+---
