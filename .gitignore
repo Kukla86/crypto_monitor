@@ -136,4 +136,22 @@ config.env
 *.sqlite3
 monitor.log
 latest_token_data.json
-github_commits_cache.json 
+github_commits_cache.json
+
+# Session files (Telegram, etc.)
+*.session
+*.session-journal
+
+# API keys and secrets
+*.key
+*.token
+*.secret
+.env
+.env.local
+.env.production
+
+# Logs and temporary files
+logs/
+*.log
+temp/
+tmp/ 
