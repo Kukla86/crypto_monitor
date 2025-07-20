@@ -6464,6 +6464,24 @@ async def setup_whale_tracking():
 
 async def main():
     """Главная асинхронная функция запуска мониторинга"""
+    import os
+    import tempfile
+    
+    # Создаем файл блокировки для предотвращения запуска нескольких экземпляров
+    lock_file = os.path.join(tempfile.gettempdir(), 'crypto_monitor.lock')
+    
+    # Проверяем, не запущен ли уже монитор
+    if os.path.exists(lock_file):
+        with open(lock_file, 'r') as f:
+            pid = f.read().strip()
+        if os.path.exists(f'/proc/{pid}') or os.path.exists(f'/tmp/{pid}'):
+            logger.error(f"Монитор уже запущен с PID {pid}")
+            return
+    
+    # Создаем файл блокировки
+    with open(lock_file, 'w') as f:
+        f.write(str(os.getpid()))
+    
     logger.info("=== Crypto Monitor стартует ===")
     
     # Проверка доступности API и сервисов
@@ -6604,6 +6622,12 @@ async def main():
         log_error("Главный цикл мониторинга", e)
         logger.critical(f"❌ Критическая ошибка в main: {e}")
     finally:
+        # Удаляем файл блокировки при завершении
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+        except:
+            pass
         logger.info("=== Crypto Monitor завершил работу ===")
 
 # --- Работа с точкой отсчёта алерта ---

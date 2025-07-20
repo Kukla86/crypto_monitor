@@ -181,7 +181,9 @@ class AlertManager:
     
     def _generate_alert_id(self, title: str, message: str, token_symbol: Optional[str]) -> str:
         """Генерация уникального ID алерта"""
-        content = f"{title}:{message}:{token_symbol or ''}"
+        # Добавляем временную метку для предотвращения дублирования
+        timestamp = int(time.time() / 60)  # Округляем до минуты
+        content = f"{title}:{message}:{token_symbol or ''}:{timestamp}"
         return hashlib.md5(content.encode()).hexdigest()[:8]
     
     async def send_alert(self, alert: Alert) -> bool:

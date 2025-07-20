@@ -507,6 +507,25 @@ class CryptoMonitorBot:
 
     def send_alert(self, user_id, alert):
         try:
+            # Создаем уникальный ключ для предотвращения дублирования
+            import time
+            alert_key = f"{alert.get('token_address', '')}:{alert.get('type', '')}:{alert.get('change', 0):.2f}:{int(time.time() / 60)}"
+            
+            # Проверяем, не был ли уже отправлен этот алерт
+            if hasattr(self, '_sent_alerts'):
+                if alert_key in self._sent_alerts:
+                    logger.debug(f"Алерт уже был отправлен: {alert_key}")
+                    return
+            else:
+                self._sent_alerts = set()
+            
+            # Добавляем в отправленные
+            self._sent_alerts.add(alert_key)
+            
+            # Ограничиваем размер множества
+            if len(self._sent_alerts) > 1000:
+                self._sent_alerts.clear()
+            
             chat_id = user_id  # Можно заменить на отдельный chat_id, если нужно
             
             alert_type = alert.get('type', 'volume')
@@ -529,6 +548,7 @@ class CryptoMonitorBot:
             
             if self.updater:
                 self.updater.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
+                logger.info(f"Алерт отправлен: {alert_key}")
         except Exception as e:
             logger.error(f"Ошибка отправки алерта: {e}")
     
@@ -1967,8 +1987,37 @@ class CryptoMonitorBot:
 
 def main():
     """Главная функция"""
-    bot = CryptoMonitorBot()
-    bot.run()
+    import os
+    import tempfile
+    
+    # Создаем файл блокировки для предотвращения запуска нескольких экземпляров
+    lock_file = os.path.join(tempfile.gettempdir(), 'crypto_monitor_bot.lock')
+    
+    try:
+        # Проверяем, не запущен ли уже бот
+        if os.path.exists(lock_file):
+            with open(lock_file, 'r') as f:
+                pid = f.read().strip()
+            if os.path.exists(f'/proc/{pid}') or os.path.exists(f'/tmp/{pid}'):
+                logger.error(f"Бот уже запущен с PID {pid}")
+                return
+        
+        # Создаем файл блокировки
+        with open(lock_file, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        bot = CryptoMonitorBot()
+        bot.run()
+        
+    except Exception as e:
+        logger.error(f"Ошибка запуска бота: {e}")
+    finally:
+        # Удаляем файл блокировки при завершении
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+        except:
+            pass
 
 if __name__ == "__main__":
     main() 
