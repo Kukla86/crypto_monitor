@@ -1,0 +1,269 @@
+# Конфигурация источников данных для мониторинга криптовалют
+sources:
+  onchain:
+    ethereum:
+      name: "Ethereum Blockchain"
+      enabled: true
+      priority: "high"
+      endpoints:
+        - name: "Etherscan"
+          url: "https://api.etherscan.io/api"
+          rate_limit: 5
+          timeout: 10
+        - name: "Alchemy"
+          url: "https://eth-mainnet.g.alchemy.com/v2/{api_key}"
+          rate_limit: 10
+          timeout: 15
+      methods:
+        - "get_token_transfers"
+        - "get_liquidity_pools"
+        - "get_whale_transactions"
+    
+    solana:
+      name: "Solana Blockchain"
+      enabled: true
+      priority: "high"
+      endpoints:
+        - name: "Solana RPC"
+          url: "https://api.mainnet-beta.solana.com"
+          rate_limit: 10
+          timeout: 10
+        - name: "Helius"
+          url: "https://rpc.helius.xyz/?api-key={api_key}"
+          rate_limit: 15
+          timeout: 12
+      methods:
+        - "get_token_transfers"
+        - "get_liquidity_pools"
+        - "get_whale_transactions"
+
+  cex:
+    binance:
+      name: "Binance"
+      enabled: true
+      priority: "high"
+      endpoints:
+        - name: "REST API"
+          url: "https://api.binance.com/api/v3"
+          rate_limit: 1200
+          timeout: 10
+        - name: "WebSocket"
+          url: "wss://stream.binance.com:9443/ws"
+          rate_limit: 100
+          timeout: 30
+      methods:
+        - "get_price"
+        - "get_volume"
+        - "get_orderbook"
+    
+    bybit:
+      name: "Bybit"
+      enabled: true
+      priority: "medium"
+      endpoints:
+        - name: "REST API"
+          url: "https://api.bybit.com/v5"
+          rate_limit: 100
+          timeout: 10
+        - name: "WebSocket"
+          url: "wss://stream.bybit.com/v5/public/spot"
+          rate_limit: 50
+          timeout: 30
+      methods:
+        - "get_price"
+        - "get_volume"
+    
+    okx:
+      name: "OKX"
+      enabled: true
+      priority: "medium"
+      endpoints:
+        - name: "REST API"
+          url: "https://www.okx.com/api/v5"
+          rate_limit: 100
+          timeout: 10
+      methods:
+        - "get_price"
+        - "get_volume"
+
+  dex:
+    dexscreener:
+      name: "DexScreener"
+      enabled: true
+      priority: "high"
+      endpoints:
+        - name: "API"
+          url: "https://api.dexscreener.com/latest"
+          rate_limit: 300
+          timeout: 15
+      methods:
+        - "get_token_info"
+        - "get_liquidity_pools"
+        - "get_price_changes"
+    
+    defillama:
+      name: "DeFi Llama"
+      enabled: true
+      priority: "medium"
+      endpoints:
+        - name: "API"
+          url: "https://api.llama.fi"
+          rate_limit: 120
+          timeout: 15
+      methods:
+        - "get_tvl"
+        - "get_protocol_info"
+    
+    geckoterminal:
+      name: "GeckoTerminal"
+      enabled: true
+      priority: "medium"
+      endpoints:
+        - name: "API"
+          url: "https://api.geckoterminal.com/api/v2"
+          rate_limit: 100
+          timeout: 15
+      methods:
+        - "get_token_info"
+        - "get_price_data"
+
+  social:
+    twitter:
+      name: "Twitter"
+      enabled: true
+      priority: "high"
+      methods:
+        - "scrape_tweets"
+        - "analyze_sentiment"
+        - "track_keywords"
+      accounts:
+        - "@fuel_network"
+        - "@arcdotfun"
+        - "@BuildOnFuel"
+        - "@SwayLang"
+        - "SolanaInsiders"
+    
+    telegram:
+      name: "Telegram"
+      enabled: true
+      priority: "medium"
+      methods:
+        - "monitor_channels"
+        - "analyze_messages"
+      channels:
+        - "@fuel_network"
+        - "@cryptosignals"
+        - "@binance_signals"
+    
+    discord:
+      name: "Discord"
+      enabled: true
+      priority: "medium"
+      methods:
+        - "monitor_servers"
+        - "analyze_messages"
+      servers:
+        - "https://discord.com/invite/fuel-network"
+    
+    github:
+      name: "GitHub"
+      enabled: true
+      priority: "medium"
+      methods:
+        - "monitor_repos"
+        - "track_commits"
+        - "analyze_changes"
+      repositories:
+        - "https://github.com/0xPlaygrounds/rig"
+        - "https://github.com/FuelLabs/fuel-core"
+        - "https://github.com/FuelLabs/sway"
+
+  analytics:
+    debank:
+      name: "DeBank"
+      enabled: true
+      priority: "medium"
+      endpoints:
+        - name: "API"
+          url: "https://api.debank.com"
+          rate_limit: 50
+          timeout: 15
+      methods:
+        - "get_portfolio"
+        - "get_protocol_info"
+    
+    arkham:
+      name: "Arkham"
+      enabled: true
+      priority: "medium"
+      endpoints:
+        - name: "API"
+          url: "https://api.arkhamintelligence.com"
+          rate_limit: 30
+          timeout: 15
+      methods:
+        - "get_entity_info"
+        - "get_transaction_history"
+    
+    bubblemaps:
+      name: "BubbleMaps"
+      enabled: true
+      priority: "low"
+      methods:
+        - "get_token_holders"
+        - "analyze_distribution"
+
+  news:
+    cointelegraph:
+      name: "Cointelegraph"
+      enabled: true
+      priority: "medium"
+      methods:
+        - "scrape_news"
+        - "analyze_sentiment"
+      url: "https://cointelegraph.com"
+    
+    coindesk:
+      name: "CoinDesk"
+      enabled: true
+      priority: "medium"
+      methods:
+        - "scrape_news"
+        - "analyze_sentiment"
+      url: "https://coindesk.com"
+    
+    decrypt:
+      name: "Decrypt"
+      enabled: true
+      priority: "medium"
+      methods:
+        - "scrape_news"
+        - "analyze_sentiment"
+      url: "https://decrypt.co"
+
+# Настройки мониторинга
+monitoring:
+  intervals:
+    onchain: 60  # секунды
+    cex: 30
+    dex: 120
+    social: 900
+    analytics: 300
+    news: 1800
+  
+  thresholds:
+    price_change: 15.0  # процент
+    volume_change: 100.0
+    tvl_change: 20.0
+    holders_change: 5
+    
+  alerts:
+    enabled: true
+    telegram: true
+    discord: false
+    email: false
+    
+  caching:
+    enabled: true
+    ttl: 300  # секунды
+    max_size: 1000 

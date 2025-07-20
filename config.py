@@ -71,8 +71,8 @@ class Config:
             'check_interval': int(os.getenv('CHECK_INTERVAL', '60')),
             'top_holders_count': int(os.getenv('TOP_HOLDERS_COUNT', '10')),
             'notification_threshold': float(os.getenv('NOTIFICATION_THRESHOLD', '500000')),
-            'price_change_threshold': float(os.getenv('PRICE_CHANGE_THRESHOLD', '10')),
-            'volume_change_threshold': float(os.getenv('VOLUME_CHANGE_THRESHOLD', '50')),
+            'price_change_threshold': float(os.getenv('PRICE_CHANGE_THRESHOLD', '15')),
+            'volume_change_threshold': float(os.getenv('VOLUME_CHANGE_THRESHOLD', '100')),
             'tvl_change_threshold': float(os.getenv('TVL_CHANGE_THRESHOLD', '20')),
             'holders_change_threshold': int(os.getenv('HOLDERS_CHANGE_THRESHOLD', '5')),
             'websocket_enabled': os.getenv('WEBSOCKET_ENABLED', 'true').lower() == 'true',
@@ -129,7 +129,11 @@ class Config:
             ],
             'github_accounts': [
                 'https://github.com/0xPlaygrounds/rig',
-                'https://github.com/FuelLabs'
+                'https://github.com/FuelLabs/fuel-core',
+                'https://github.com/FuelLabs/sway',
+                'https://github.com/FuelLabs/fuel-indexer',
+                'https://github.com/ethereum/go-ethereum',
+                'https://github.com/elizaOS/eliza'
             ],
             'reddit_subreddits': [
                 'r/cryptocurrency',
@@ -160,9 +164,12 @@ class Config:
             }
         
         # Discord токен (опционально)
-        discord_token = os.getenv('DISCORD_BOT_TOKEN') or os.getenv('DISCORD_USER_TOKEN')
+        discord_token = os.getenv('DISCORD_USER_TOKEN')
         if discord_token:
             self.social_config['discord_token'] = discord_token
+            print(f"Discord токен загружен: {discord_token[:10]}...")
+        else:
+            print("Discord токен не найден в переменных окружения")
     
     def _load_database_config(self):
         """Загрузка конфигурации базы данных"""
@@ -230,6 +237,45 @@ class Config:
                 'priority': 'high',
                 'min_amount_usd': 500000
             },
+            'URO': {
+                'symbol': 'URO',
+                'name': 'Urolithin A',
+                'chain': 'solana',
+                'contract': 'FvgqHMfL9yn39V79huDPy3YUNDoYJpuLWng2JfmQpump',
+                'decimals': 9,
+                'priority': 'high',
+                'min_amount_usd': 500000,
+                'exchanges': ['htx', 'bitmart', 'gate', 'mexc', 'ascendex', 'bingx', 'raydium']
+            },
+            'XION': {
+                'symbol': 'XION',
+                'name': 'XION',
+                'chain': 'xion',
+                'contract': 'native',
+                'decimals': 6,
+                'priority': 'high',
+                'min_amount_usd': 500000,
+                'exchanges': ['htx', 'lbank', 'gate', 'bitget', 'bybit', 'mexc', 'kucoin']
+            },
+            'AI16Z': {
+                'symbol': 'AI16Z',
+                'name': 'AI16Z',
+                'chain': 'solana',
+                'contract': 'HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC',
+                'decimals': 9,
+                'priority': 'high',
+                'min_amount_usd': 500000
+            },
+            'SAHARA': {
+                'symbol': 'SAHARA',
+                'name': 'Sahara AI',
+                'chain': 'ethereum',
+                'contract': '0xfdffb411c4a70aa7c95d5c981a6fb4da867e1111',
+                'decimals': 18,
+                'priority': 'high',
+                'min_amount_usd': 500000,
+                'exchanges': ['binance', 'okx', 'bybit', 'gate', 'upbit', 'mexc']
+            },
             'VIRTUAL': {
                 'symbol': 'VIRTUAL',
                 'name': 'Virtuals Protocol',
@@ -262,7 +308,8 @@ class Config:
                 'contract': '0x95cef13441be50d20ca4558cc0a27b601ac544e5',
                 'decimals': 18,
                 'priority': 'high',
-                'min_amount_usd': 500000
+                'min_amount_usd': 500000,
+                'exchanges': ['binance', 'okx', 'bybit', 'gate', 'mexc']
             },
             'ANON': {
                 'symbol': 'ANON',
@@ -274,7 +321,8 @@ class Config:
                 },
                 'decimals': 18,
                 'priority': 'high',
-                'min_amount_usd': 500000
+                'min_amount_usd': 500000,
+                'exchanges': ['gate', 'aerodrome', 'bitunix', 'raydium', 'kraken']
             }
         }
     

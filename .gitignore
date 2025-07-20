@@ -135,6 +135,7 @@ config.env
 *.sqlite
 *.sqlite3
 monitor.log
+discord_monitor.log
 latest_token_data.json
 github_commits_cache.json
 

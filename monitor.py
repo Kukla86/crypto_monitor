@@ -18,7 +18,12 @@ import random
 import websockets
 import threading
 from collections import deque
-from googletrans import Translator
+# Проверка доступности переводчика
+try:
+    from googletrans import Translator
+    TRANSLATOR_AVAILABLE = True
+except ImportError:
+    TRANSLATOR_AVAILABLE = False
 from telethon import TelegramClient, events
 import discord
 import subprocess
@@ -32,6 +37,19 @@ from flask import Flask, request, jsonify
 
 # Создаем Flask app для webhook
 app = Flask(__name__)
+
+# Импорт Telegram бота
+try:
+    from telegram_bot import CryptoMonitorBot, DexScreenerMonitor
+    TELEGRAM_BOT_AVAILABLE = True
+except ImportError:
+    TELEGRAM_BOT_AVAILABLE = False
+    # Временно используем print, так как logger еще не определен
+    print("Telegram бот недоступен - модуль telegram_bot не найден")
+
+# Глобальные переменные для кэширования алертов
+alert_cache = {}
+last_alert_time = {}
 
 # Импорт конфигурации
 from config import get_config
@@ -66,6 +84,29 @@ try:
 except ImportError:
     NEWS_ANALYZER_AVAILABLE = False
 
+# Импорт новых модулей для улучшения системы
+try:
+    from performance_monitor import get_performance_monitor, performance_decorator
+    from alert_manager import get_alert_manager, AlertLevel, AlertChannel, send_alert
+    from recovery_manager import get_recovery_manager, RecoveryConfig, RecoveryStrategy, recovery_decorator
+    from config_manager import ConfigManager
+    from cache_manager import CacheManager
+    NEW_MODULES_AVAILABLE = True
+    print("Новые модули загружены успешно")
+except ImportError as e:
+    NEW_MODULES_AVAILABLE = False
+    print(f"Новые модули недоступны: {e}")
+    # Fallback функции
+    def performance_decorator(operation_name):
+        def decorator(func):
+            return func
+        return decorator
+    
+    def recovery_decorator(component_name, config=None):
+        def decorator(func):
+            return func
+        return decorator
+
 # Загружаем переменные окружения из .env файла
 from dotenv import load_dotenv
 load_dotenv('config.env')
@@ -74,7 +115,7 @@ load_dotenv('config.env')
 config = get_config()
 
 # OpenAI API ключ
-OPENAI_API_KEY = config.api_config.get('openai', {}).get('api_key') if 'openai' in config.api_config else None
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 # --- Настройка детального логирования ---
 """
@@ -86,24 +127,40 @@ OPENAI_API_KEY = config.api_config.get('openai', {}).get('api_key') if 'openai' 
 """
 import logging.handlers
 
-# Основной логгер
-logging.basicConfig(
-    level=getattr(logging, config.logging_config['level'], logging.INFO),
-    format='%(asctime)s %(levelname)s [%(module)s:%(lineno)d] %(message)s',
-    handlers=[
-        logging.FileHandler(config.logging_config['file'], mode='a', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+def setup_logging():
+    """Настройка логирования"""
+    try:
+        logging.basicConfig(
+            level=getattr(logging, config.logging_config['level'], logging.INFO),
+            format='%(asctime)s %(levelname)s [%(module)s:%(lineno)d] %(message)s',
+            handlers=[
+                logging.FileHandler(config.logging_config['file'], mode='a', encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+    except Exception as e:
+        # Fallback логирование если конфигурация недоступна
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s %(levelname)s [%(module)s:%(lineno)d] %(message)s',
+            handlers=[
+                logging.FileHandler('monitoring.log', mode='a', encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        print(f"Ошибка настройки логирования: {e}")
 
-# Логгер для ошибок
-error_logger = logging.getLogger('error_logger')
-error_logger.setLevel(logging.ERROR)
-error_handler = logging.FileHandler('error.log')
-error_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(module)s:%(lineno)d] %(message)s'))
-error_logger.addHandler(error_handler)
+    # Логгер для ошибок
+    error_logger = logging.getLogger('error_logger')
+    error_logger.setLevel(logging.ERROR)
+    error_handler = logging.FileHandler('error.log')
+    error_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(module)s:%(lineno)d] %(message)s'))
+    error_logger.addHandler(error_handler)
 
-logger = logging.getLogger(__name__)
+    return logging.getLogger(__name__), error_logger
+
+# Инициализируем логгеры
+logger, error_logger = setup_logging()
 
 # Функция для детального логирования ошибок
 def log_error(operation: str, error: Exception, context: dict = None):
@@ -128,15 +185,76 @@ realtime_data = {
         'volume_24h': 0.0,
         'price_change_24h': 0.0,
         'last_update': None,
-        'source': None
+        'source': None,
+        'technical_indicators': {},
+        'alerts': []
     },
     'ARC': {
         'price': 0.0,
         'volume_24h': 0.0,
         'price_change_24h': 0.0,
         'last_update': None,
-        'source': None
+        'source': None,
+        'technical_indicators': {},
+        'alerts': []
+    },
+    'VIRTUAL': {
+        'price': 0.0,
+        'volume_24h': 0.0,
+        'price_change_24h': 0.0,
+        'last_update': None,
+        'source': None,
+        'technical_indicators': {},
+        'alerts': []
+    },
+    'BID': {
+        'price': 0.0,
+        'volume_24h': 0.0,
+        'price_change_24h': 0.0,
+        'last_update': None,
+        'source': None,
+        'technical_indicators': {},
+        'alerts': []
+    },
+    'MANTA': {
+        'price': 0.0,
+        'volume_24h': 0.0,
+        'price_change_24h': 0.0,
+        'last_update': None,
+        'source': None,
+        'technical_indicators': {},
+        'alerts': []
+    },
+    'ANON': {
+        'price': 0.0,
+        'volume_24h': 0.0,
+        'price_change_24h': 0.0,
+        'last_update': None,
+        'source': None,
+        'technical_indicators': {},
+        'alerts': []
     }
+}
+
+# Портфолио трекинг
+portfolio_data = {
+    'holdings': {},  # {symbol: {'amount': float, 'avg_price': float}}
+    'total_value': 0.0,
+    'total_pnl': 0.0,
+    'last_update': None
+}
+
+# WebSocket подключения
+websocket_connections = {}
+websocket_tasks = []
+
+# Технические индикаторы и алерты
+technical_alerts = {
+    'rsi_overbought': 70,
+    'rsi_oversold': 30,
+    'macd_signal_threshold': 0.001,
+    'volume_spike_threshold': 2.0,  # 200% увеличение объема
+    'price_change_threshold': 5.0   # 5% изменение цены
 }
 
 # Очередь для алертов
@@ -199,13 +317,20 @@ async def retry_request(func, *args, max_retries=None, **kwargs):
 def init_openai():
     """Инициализация OpenAI API"""
     try:
-        if 'openai' in config.api_config:
-            openai.api_key = config.api_config['openai']['api_key']
-            logger.info("OpenAI API инициализирован")
+        if OPENAI_API_KEY and OPENAI_API_KEY != 'your_openai_api_key_here':
+            # Пробуем новый API
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=OPENAI_API_KEY)
+                logger.info("✅ OpenAI API инициализирован (новая версия)")
+            except ImportError:
+                # Fallback для старой версии
+                openai.api_key = OPENAI_API_KEY
+                logger.info("✅ OpenAI API инициализирован (старая версия)")
         else:
-            logger.warning("OpenAI API ключ не настроен")
+            logger.warning("⚠️ OpenAI API ключ не настроен")
     except Exception as e:
-        logger.error(f"Ошибка инициализации OpenAI: {e}")
+        logger.error(f"❌ Ошибка инициализации OpenAI: {e}")
 
 async def analyze_with_chatgpt(prompt: str, analysis_type: str) -> Optional[Dict[str, Any]]:
     """Анализ с помощью ChatGPT"""
@@ -217,7 +342,7 @@ async def analyze_with_chatgpt(prompt: str, analysis_type: str) -> Optional[Dict
         logger.info(f"🤖 Запуск AI анализа типа: {analysis_type}")
         
         # Настройка модели в зависимости от типа анализа
-        model = "gpt-3.5-turbo"  # Можно изменить на gpt-4 если доступен
+        model = "gpt-4o"  # Используем GPT-4 Omni для лучшего анализа
         
         # Создаем сообщение для ChatGPT
         messages = [
@@ -227,28 +352,47 @@ async def analyze_with_chatgpt(prompt: str, analysis_type: str) -> Optional[Dict
         
         logger.info(f"📤 Отправка запроса к OpenAI API (модель: {model})")
         
-        # Выполняем запрос к OpenAI API
-        response = await asyncio.to_thread(
-            openai.ChatCompletion.create,
-            model=model,
-            messages=messages,
-            max_tokens=1000,
-            temperature=0.7
-        )
+        # Выполняем запрос к OpenAI API с новым синтаксисом
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=model,
+                messages=messages,
+                max_tokens=1000,
+                temperature=0.7
+            )
+            
+            # Преобразуем ответ в старый формат для совместимости
+            result = {
+                'choices': [{
+                    'message': {
+                        'content': response.choices[0].message.content
+                    }
+                }]
+            }
+            
+            logger.info("✅ AI анализ успешно завершен")
+            return result
+            
+        except ImportError:
+            # Fallback для старой версии OpenAI
+            logger.info("Используем старую версию OpenAI API")
+            response = await asyncio.to_thread(
+                openai.ChatCompletion.create,
+                model=model,
+                messages=messages,
+                max_tokens=1000,
+                temperature=0.7
+            )
+            
+            logger.info("✅ AI анализ успешно завершен (старая версия)")
+            return response
         
-        logger.info("✅ AI анализ успешно завершен")
-        return response
-        
-    except openai.error.AuthenticationError as e:
-        log_error("OpenAI аутентификация", e, {"analysis_type": analysis_type})
-        return None
-    except openai.error.RateLimitError as e:
-        log_error("OpenAI rate limit", e, {"analysis_type": analysis_type})
-        return None
-    except openai.error.APIError as e:
-        log_error("OpenAI API ошибка", e, {"analysis_type": analysis_type})
-        return None
     except Exception as e:
+        logger.error(f"❌ Ошибка AI анализа: {e}")
         log_error("AI анализ", e, {"analysis_type": analysis_type})
         return None
 
@@ -332,6 +476,19 @@ def init_database():
                     )
                 ''')
                 
+                # Таблица для пиковых значений (новая)
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS peak_values (
+                        symbol TEXT PRIMARY KEY,
+                        peak_price REAL DEFAULT 0.0,
+                        peak_volume REAL DEFAULT 0.0,
+                        last_alert_time INTEGER DEFAULT 0,
+                        last_price_alert REAL DEFAULT 0.0,
+                        last_volume_alert REAL DEFAULT 0.0,
+                        updated_at INTEGER DEFAULT 0
+                    )
+                ''')
+                
                 # Таблица для обработанных твитов
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS processed_tweets (
@@ -391,12 +548,26 @@ async def websocket_bybit_handler():
                                     realtime_data['FUEL']['price'] = price
                                     realtime_data['FUEL']['last_update'] = datetime.now()
                                     realtime_data['FUEL']['source'] = 'Bybit WS'
+                                    
+                                    # Сохраняем в БД
+                                    await save_realtime_data('FUEL', {
+                                        'price': price,
+                                        'volume_24h': realtime_data['FUEL'].get('volume_24h', 0),
+                                        'price_change_24h': realtime_data['FUEL'].get('price_change_24h', 0)
+                                    }, 'Bybit WS')
                             elif 'ARC' in symbol:
                                 if 'b' in data['data'] and data['data']['b']:
                                     price = float(data['data']['b'][0][0])
                                     realtime_data['ARC']['price'] = price
                                     realtime_data['ARC']['last_update'] = datetime.now()
                                     realtime_data['ARC']['source'] = 'Bybit WS'
+                                    
+                                    # Сохраняем в БД
+                                    await save_realtime_data('ARC', {
+                                        'price': price,
+                                        'volume_24h': realtime_data['ARC'].get('volume_24h', 0),
+                                        'price_change_24h': realtime_data['ARC'].get('price_change_24h', 0)
+                                    }, 'Bybit WS')
                                     
                     except asyncio.TimeoutError:
                         # Отправляем ping для поддержания соединения
@@ -414,6 +585,170 @@ async def websocket_bybit_handler():
             # Увеличиваем delay с ограничением
             reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
+async def websocket_okx_handler():
+    """WebSocket обработчик для OKX"""
+    reconnect_delay = 5
+    max_reconnect_delay = 60
+    
+    while True:
+        try:
+            if not await rate_limit_check('okx_ws'):
+                await asyncio.sleep(1)
+                continue
+            
+            url = "wss://ws.okx.com:8443/ws/v5/public"
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as websocket:
+                logger.info("WebSocket подключение к OKX установлено")
+                
+                # Подписываемся на ARC и VIRTUAL
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "args": [
+                        {"channel": "tickers", "instId": "ARC-USDT"},
+                        {"channel": "tickers", "instId": "VIRTUAL-USDT"}
+                    ]
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                
+                reconnect_delay = 5
+                
+                while True:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                        data = json.loads(message)
+                        
+                        if 'data' in data:
+                            ticker_data = data['data'][0]
+                            symbol = ticker_data.get('instId', '').replace('-USDT', '')
+                            
+                            if symbol in ['ARC', 'VIRTUAL']:
+                                price = float(ticker_data.get('last', 0))
+                                volume = float(ticker_data.get('vol24h', 0))
+                                price_change = float(ticker_data.get('change24h', 0)) * 100
+                                
+                                realtime_data[symbol].update({
+                                    'price': price,
+                                    'volume_24h': volume,
+                                    'price_change_24h': price_change,
+                                    'last_update': datetime.now(),
+                                    'source': 'OKX WS'
+                                })
+                                
+                                # Сохраняем в БД
+                                await save_realtime_data(symbol, {
+                                    'price': price,
+                                    'volume_24h': volume,
+                                    'price_change_24h': price_change
+                                }, 'OKX WS')
+                                
+                                logger.info(f"OKX WebSocket: {symbol} = ${price:.6f} (24h: {price_change:+.2f}%)")
+                                await check_realtime_alerts(symbol, realtime_data[symbol])
+                                
+                    except asyncio.TimeoutError:
+                        await websocket.ping()
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("OKX WebSocket соединение закрыто")
+                        break
+                    except Exception as e:
+                        logger.error(f"Ошибка обработки OKX WebSocket: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"OKX WebSocket соединение разорвано: {e}")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+async def websocket_gate_handler():
+    """WebSocket обработчик для Gate.io"""
+    reconnect_delay = 5
+    max_reconnect_delay = 60
+    
+    while True:
+        try:
+            if not await rate_limit_check('gate_ws'):
+                await asyncio.sleep(1)
+                continue
+            
+            url = "wss://api.gateio.ws/ws/v4/"
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as websocket:
+                logger.info("WebSocket подключение к Gate.io установлено")
+                
+                # Подписываемся на FUEL, VIRTUAL и BID
+                subscribe_msg = {
+                    "time": int(time.time()),
+                    "channel": "spot.tickers",
+                    "event": "subscribe",
+                    "payload": ["FUEL_USDT", "VIRTUAL_USDT", "BID_USDT"]
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                
+                reconnect_delay = 5
+                
+                while True:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                        data = json.loads(message)
+                        
+                        if 'result' in data and data['result'].get('status') == 'success':
+                            continue  # Подтверждение подписки
+                        
+                        if 'result' in data and 'currency_pair' in data['result']:
+                            ticker_data = data['result']
+                            symbol = ticker_data.get('currency_pair', '').replace('_USDT', '')
+                            
+                            if symbol in ['FUEL', 'VIRTUAL', 'BID']:
+                                price = float(ticker_data.get('last', 0))
+                                volume = float(ticker_data.get('quote_volume', 0))
+                                price_change = float(ticker_data.get('change_percentage', 0))
+                                
+                                realtime_data[symbol].update({
+                                    'price': price,
+                                    'volume_24h': volume,
+                                    'price_change_24h': price_change,
+                                    'last_update': datetime.now(),
+                                    'source': 'Gate.io WS'
+                                })
+                                
+                                # Сохраняем в БД
+                                await save_realtime_data(symbol, {
+                                    'price': price,
+                                    'volume_24h': volume,
+                                    'price_change_24h': price_change
+                                }, 'Gate.io WS')
+                                
+                                logger.info(f"Gate.io WebSocket: {symbol} = ${price:.6f} (24h: {price_change:+.2f}%)")
+                                await check_realtime_alerts(symbol, realtime_data[symbol])
+                                
+                    except asyncio.TimeoutError:
+                        await websocket.ping()
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("Gate.io WebSocket соединение закрыто")
+                        break
+                    except Exception as e:
+                        logger.error(f"Ошибка обработки Gate.io WebSocket: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Gate.io WebSocket соединение разорвано: {e}")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+async def start_websocket_connections():
+    """Запуск всех WebSocket подключений"""
+    logger.info("🚀 Запуск WebSocket подключений...")
+    
+    # Создаем задачи для каждого WebSocket
+    websocket_tasks = [
+        asyncio.create_task(websocket_bybit_handler()),
+        asyncio.create_task(websocket_okx_handler()),
+        asyncio.create_task(websocket_gate_handler())
+    ]
+    
+    # Запускаем все WebSocket подключения
+    await asyncio.gather(*websocket_tasks, return_exceptions=True)
+    
+    logger.info("✅ WebSocket подключения запущены")
+
 async def save_realtime_data(symbol: str, data: Dict[str, Any], source: str):
     """Сохранение real-time данных в БД"""
     try:
@@ -427,25 +762,256 @@ async def save_realtime_data(symbol: str, data: Dict[str, Any], source: str):
     except Exception as e:
         logger.error(f"Ошибка сохранения real-time данных: {e}")
 
-async def check_realtime_alerts(symbol: str, data: Dict[str, Any]):
-    """Проверка алертов в реальном времени"""
-    try:
-        # Проверка резких изменений цены
-        price_change = abs(data['price_change_24h'])
-        if price_change > config.monitoring_config['price_change_threshold']:
-            alert_message = f"🚨 Резкое изменение цены {symbol}: {price_change:.2f}% за 24ч"
-            send_alert('WARNING', alert_message, symbol)
-            alert_queue.append({
-                'level': 'WARNING',
-                'message': alert_message,
-                'symbol': symbol,
-                'timestamp': datetime.now()
-            })
-        
+# Глобальные переменные для отслеживания пиковых значений
+peak_values = {}  # {symbol: {'price': float, 'volume': float, 'last_alert_time': int}}
 
+def get_peak_values(symbol: str) -> Dict[str, Any]:
+    """Получает пиковые значения для токена"""
+    try:
+        peak_data = peak_values.get(symbol, {
+            'price': 0.0,
+            'volume': 0.0,
+            'last_alert_time': 0,
+            'last_price_alert': 0.0,
+            'last_volume_alert': 0.0
+        })
+        
+        # Валидация типов данных
+        for key in ['price', 'volume', 'last_price_alert', 'last_volume_alert']:
+            if not isinstance(peak_data[key], (int, float)):
+                logger.warning(f"Некорректный тип данных для {symbol}.{key}: {type(peak_data[key])}")
+                peak_data[key] = 0.0
+                
+        if not isinstance(peak_data['last_alert_time'], int):
+            logger.warning(f"Некорректный тип времени для {symbol}: {type(peak_data['last_alert_time'])}")
+            peak_data['last_alert_time'] = 0
+            
+        return peak_data
+    except Exception as e:
+        logger.error(f"Ошибка получения пиковых значений для {symbol}: {e}")
+        return {
+            'price': 0.0,
+            'volume': 0.0,
+            'last_alert_time': 0,
+            'last_price_alert': 0.0,
+            'last_volume_alert': 0.0
+        }
+
+def set_peak_values(symbol: str, price: float = None, volume: float = None, alert_type: str = None):
+    """Устанавливает пиковые значения для токена"""
+    current_time = int(time.time())
+    
+    if symbol not in peak_values:
+        peak_values[symbol] = {
+            'price': 0.0,
+            'volume': 0.0,
+            'last_alert_time': 0,
+            'last_price_alert': 0.0,
+            'last_volume_alert': 0.0
+        }
+    
+    # Обновляем пиковые значения
+    if price is not None and price > peak_values[symbol]['price']:
+        peak_values[symbol]['price'] = price
+    
+    if volume is not None and volume > peak_values[symbol]['volume']:
+        peak_values[symbol]['volume'] = volume
+    
+    # Обновляем время последнего алерта
+    peak_values[symbol]['last_alert_time'] = current_time
+    
+    # Обновляем значения последних алертов
+    if alert_type == 'price' and price is not None:
+        peak_values[symbol]['last_price_alert'] = price
+    elif alert_type == 'volume' and volume is not None:
+        peak_values[symbol]['last_volume_alert'] = volume
+    
+    # Сохраняем в базу данных
+    save_peak_values_to_db(symbol, peak_values[symbol])
+
+def save_peak_values_to_db(symbol: str, peak_data: Dict[str, Any]):
+    """Сохраняет пиковые значения в базу данных"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO peak_values 
+                    (symbol, peak_price, peak_volume, last_alert_time, last_price_alert, last_volume_alert, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    symbol,
+                    peak_data['price'],
+                    peak_data['volume'],
+                    peak_data['last_alert_time'],
+                    peak_data['last_price_alert'],
+                    peak_data['last_volume_alert'],
+                    int(time.time())
+                ))
+    except Exception as e:
+        logger.error(f"Ошибка сохранения пиковых значений для {symbol}: {e}")
+
+def load_peak_values_from_db():
+    """Загружает пиковые значения из базы данных"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT symbol, peak_price, peak_volume, last_alert_time, last_price_alert, last_volume_alert
+                FROM peak_values
+            ''')
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                symbol, peak_price, peak_volume, last_alert_time, last_price_alert, last_volume_alert = row
+                peak_values[symbol] = {
+                    'price': float(peak_price) if peak_price else 0.0,
+                    'volume': float(peak_volume) if peak_volume else 0.0,
+                    'last_alert_time': int(last_alert_time) if last_alert_time else 0,
+                    'last_price_alert': float(last_price_alert) if last_price_alert else 0.0,
+                    'last_volume_alert': float(last_volume_alert) if last_volume_alert else 0.0
+                }
+            
+            logger.info(f"Загружено {len(peak_values)} записей пиковых значений из БД")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки пиковых значений из БД: {e}")
+
+def should_update_peak(symbol: str, current_price: float, current_volume: float, 
+                      price_change_threshold: float = 5.0, volume_change_threshold: float = 10.0) -> bool:
+    """Определяет, нужно ли обновить пиковые значения"""
+    peak = get_peak_values(symbol)
+    
+    # Если это первый запуск или прошло много времени
+    if peak['last_alert_time'] == 0:
+        return True
+    
+    # Проверяем, не слишком ли часто обновляем
+    current_time = int(time.time())
+    if current_time - peak['last_alert_time'] < 300:  # 5 минут
+        return False
+    
+    # Проверяем значимость изменений
+    price_change = abs((current_price - peak['price']) / peak['price']) * 100 if peak['price'] > 0 else 0
+    volume_change = abs((current_volume - peak['volume']) / peak['volume']) * 100 if peak['volume'] > 0 else 0
+    
+    return price_change > price_change_threshold or volume_change > volume_change_threshold
+
+def calculate_relative_change(current_value: float, reference_value: float) -> float:
+    """Вычисляет относительное изменение в процентах"""
+    try:
+        # Дополнительная валидация типов
+        if not isinstance(current_value, (int, float)) or not isinstance(reference_value, (int, float)):
+            logger.warning(f"Некорректные типы данных для расчета изменения: current={type(current_value)}, reference={type(reference_value)}")
+            return 0.0
+            
+        if reference_value <= 0:
+            return 0.0
+        return ((current_value - reference_value) / reference_value) * 100
+    except Exception as e:
+        logger.error(f"Ошибка расчета относительного изменения: {e}")
+        return 0.0
+
+async def check_realtime_alerts(symbol: str, data: Dict[str, Any]):
+    """Проверка алертов в реальном времени с техническим анализом"""
+    try:
+        # Получаем историю цен для технического анализа
+        price_history = get_price_history(symbol, hours=24)
+        if len(price_history) < 20:
+            return
+        
+        prices = [float(price) for _, price in price_history]
+        current_price = data['price']
+        
+        # Рассчитываем технические индикаторы
+        indicators = calculate_technical_indicators(symbol, prices)
+        
+        # Обновляем данные в realtime_data
+        realtime_data[symbol]['technical_indicators'] = indicators
+        
+        # Проверяем алерты на основе индикаторов
+        alerts = []
+        
+        # 1. RSI алерты
+        if 'rsi' in indicators:
+            rsi = indicators['rsi']
+            if rsi > technical_alerts['rsi_overbought']:
+                alerts.append(f"📈 RSI перекуплен ({rsi:.1f}) - возможна коррекция")
+            elif rsi < technical_alerts['rsi_oversold']:
+                alerts.append(f"📉 RSI перепродан ({rsi:.1f}) - возможен отскок")
+        
+        # 2. MACD алерты
+        if 'macd' in indicators and indicators['macd']:
+            macd = indicators['macd']
+            if abs(macd['histogram']) > technical_alerts['macd_signal_threshold']:
+                if macd['histogram'] > 0:
+                    alerts.append(f"🟢 MACD бычий сигнал (гистограмма: {macd['histogram']:.4f})")
+                else:
+                    alerts.append(f"🔴 MACD медвежий сигнал (гистограмма: {macd['histogram']:.4f})")
+        
+        # 3. Bollinger Bands алерты
+        if 'bollinger_bands' in indicators and indicators['bollinger_bands']:
+            bb = indicators['bollinger_bands']
+            if current_price <= bb['lower']:
+                alerts.append(f"📊 Цена ниже нижней полосы Боллинджера - возможен отскок")
+            elif current_price >= bb['upper']:
+                alerts.append(f"📊 Цена выше верхней полосы Боллинджера - возможна коррекция")
+        
+        # 4. Объемные алерты
+        current_volume = data['volume_24h']
+        avg_volume = sum([float(vol) for _, vol in get_volume_history(symbol, hours=24)]) / 24
+        if avg_volume > 0 and current_volume > avg_volume * technical_alerts['volume_spike_threshold']:
+            alerts.append(f"📈 Спайк объема: {current_volume/avg_volume:.1f}x от среднего")
+        
+        # 5. Ценовые алерты
+        price_change = abs(data['price_change_24h'])
+        if price_change > technical_alerts['price_change_threshold']:
+            direction = "📈" if data['price_change_24h'] > 0 else "📉"
+            alerts.append(f"{direction} Резкое изменение цены: {price_change:.2f}% за 24ч")
+        
+        # 6. Скрещивание скользящих средних
+        if 'sma_20' in indicators and 'sma_50' in indicators:
+            sma_20 = indicators['sma_20']
+            sma_50 = indicators['sma_50']
+            if current_price > sma_20 > sma_50:
+                alerts.append(f"🟢 Золотой крест: цена > SMA20 > SMA50")
+            elif current_price < sma_20 < sma_50:
+                alerts.append(f"🔴 Мертвый крест: цена < SMA20 < SMA50")
+        
+        # Отправляем алерты
+        for alert in alerts:
+            alert_message = f"🔔 {symbol} ТЕХНИЧЕСКИЙ АЛЕРТ: {alert}"
+            await send_alert('INFO', alert_message, symbol)
+            
+            # Сохраняем алерт в realtime_data
+            realtime_data[symbol]['alerts'].append({
+                'message': alert,
+                'timestamp': datetime.now(),
+                'type': 'technical'
+            })
+            
+            logger.info(f"Отправлен технический алерт для {symbol}: {alert}")
+        
+        # Ограничиваем количество алертов в памяти
+        if len(realtime_data[symbol]['alerts']) > 10:
+            realtime_data[symbol]['alerts'] = realtime_data[symbol]['alerts'][-10:]
             
     except Exception as e:
         logger.error(f"Ошибка проверки real-time алертов: {e}")
+
+def get_volume_history(symbol: str, hours: int = 24) -> List[tuple]:
+    """Получение истории объемов"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT timestamp, volume_24h FROM realtime_data 
+                WHERE symbol = ? AND timestamp >= datetime('now', '-{} hours')
+                ORDER BY timestamp DESC
+            '''.format(hours), (symbol,))
+            return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка получения истории объемов: {e}")
+        return []
 
 def calculate_technical_indicators(symbol: str, price_history: List[float]) -> Dict[str, Any]:
     """Расчет технических индикаторов"""
@@ -745,6 +1311,8 @@ async def save_technical_indicators(symbol: str, indicators: Dict[str, Any]):
         logger.error(f"Ошибка сохранения технических индикаторов: {e}")
 
 @handle_errors("check_onchain")
+@performance_decorator("check_onchain")
+@recovery_decorator("onchain_monitor")
 async def check_onchain(session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
     Проверка on-chain данных (Etherscan, Solana RPC)
@@ -785,7 +1353,39 @@ async def check_onchain(session: aiohttp.ClientSession) -> Dict[str, Any]:
                 continue
                 
             results[symbol] = data
+            
+            # Сохраняем данные в БД
+            if data and not all('error' in str(v) for v in data.values() if isinstance(v, dict)):
+                # Находим лучшие данные (без ошибок)
+                best_data = {}
+                if isinstance(data, dict):
+                    # Для мультичейн токенов
+                    for chain, chain_data in data.items():
+                        if isinstance(chain_data, dict) and 'error' not in chain_data:
+                            if 'large_transfers' in chain_data:
+                                best_data['large_transfers'] = chain_data['large_transfers']
+                            if 'total_transactions' in chain_data:
+                                best_data['total_transactions'] = chain_data['total_transactions']
+                            if 'last_activity' in chain_data:
+                                best_data['last_activity'] = chain_data['last_activity']
+                            break
+                else:
+                    # Для обычных токенов
+                    if 'large_transfers' in data:
+                        best_data['large_transfers'] = data['large_transfers']
+                    if 'total_transactions' in data:
+                        best_data['total_transactions'] = data['total_transactions']
+                    if 'last_activity' in data:
+                        best_data['last_activity'] = data['last_activity']
+                
+                if best_data:
+                    save_token_data(symbol, best_data)
+                    logger.info(f"✅ Сохранены on-chain данные для {symbol}: {best_data}")
+            
             logger.info(f"On-chain данные для {symbol}: {data}")
+            
+            # Проверяем алерты для этого токена
+            await check_alerts(symbol, {'onchain': data})
             
         except Exception as e:
             logger.error(f"Ошибка проверки on-chain данных для {symbol}: {e}")
@@ -1013,6 +1613,28 @@ async def check_solana_onchain(session: aiohttp.ClientSession, token: Dict) -> D
         return {'error': str(e)}
 
 @handle_errors("check_cex")
+@performance_decorator("check_cex")
+@recovery_decorator("cex_monitor")
+async def cex_loop(session: aiohttp.ClientSession):
+    """Бесконечный цикл мониторинга CEX данных"""
+    logger.info("🏪 Запуск CEX мониторинга в цикле...")
+    while True:
+        try:
+            logger.info("🏪 Проверка данных CEX...")
+            result = await check_cex(session)
+            
+            # Детальное логирование результатов
+            for symbol, data in result.items():
+                if 'error' not in str(data):
+                    logger.info(f"✅ CEX данные для {symbol}: {data}")
+                else:
+                    logger.warning(f"⚠️ CEX ошибка для {symbol}: {data}")
+            
+            await asyncio.sleep(config.monitoring_config['check_interval'])
+        except Exception as e:
+            logger.error(f"❌ Ошибка в cex_loop: {e}")
+            await asyncio.sleep(30)
+
 async def check_cex(session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
     Проверка данных CEX (Binance, Bybit, OKX, HTX, Gate)
@@ -1025,44 +1647,153 @@ async def check_cex(session: aiohttp.ClientSession) -> Dict[str, Any]:
         try:
             cex_data = {}
             
-            # Проверка Bybit (для FUEL и VIRTUAL)
-            if symbol in ['FUEL', 'VIRTUAL']:
+            # Получаем список бирж для токена из конфигурации
+            token_config = TOKENS.get(symbol, {})
+            exchanges = token_config.get('exchanges', [])
+            
+            # Проверка Bybit
+            if 'bybit' in exchanges or symbol in ['FUEL', 'VIRTUAL']:
                 bybit_data = await check_bybit_price(session, symbol)
                 cex_data['bybit'] = bybit_data
             else:
                 cex_data['bybit'] = {'error': 'Not traded on Bybit'}
             
-            # Проверка OKX (для ARC и VIRTUAL)
-            if symbol in ['ARC', 'VIRTUAL']:
+            # Проверка OKX
+            if 'okx' in exchanges or symbol in ['ARC', 'VIRTUAL']:
                 okx_data = await check_okx_price(session, symbol)
                 cex_data['okx'] = okx_data
             else:
                 cex_data['okx'] = {'error': 'Not traded on OKX'}
             
-            # Проверка HTX (для ARC и VIRTUAL)
-            if symbol in ['ARC', 'VIRTUAL']:
+            # Проверка HTX
+            if 'htx' in exchanges or symbol in ['ARC', 'VIRTUAL']:
                 htx_data = await check_htx_price(session, symbol)
                 cex_data['htx'] = htx_data
             else:
                 cex_data['htx'] = {'error': 'Not traded on HTX'}
             
-            # Проверка Gate.io (для FUEL, VIRTUAL и BID)
-            if symbol in ['FUEL', 'VIRTUAL', 'BID']:
+            # Проверка Gate.io
+            if 'gate' in exchanges or symbol in ['FUEL', 'VIRTUAL', 'BID']:
                 gate_data = await check_gate_price(session, symbol)
                 cex_data['gate'] = gate_data
             else:
                 cex_data['gate'] = {'error': 'Not traded on Gate.io'}
             
-            # Проверка MEXC (для BID)
-            if symbol == 'BID':
+            # Проверка MEXC
+            if 'mexc' in exchanges or symbol in ['BID', 'MANTA', 'SAHARA']:
                 mexc_data = await check_mexc_price(session, symbol)
                 cex_data['mexc'] = mexc_data
             else:
                 cex_data['mexc'] = {'error': 'Not traded on MEXC'}
             
+            # Проверка Binance
+            if 'binance' in exchanges or symbol in ['MANTA', 'SAHARA']:
+                binance_data = await check_binance_price(session, symbol)
+                cex_data['binance'] = binance_data
+            else:
+                cex_data['binance'] = {'error': 'Not traded on Binance'}
+            
+            # Проверка Upbit
+            if 'upbit' in exchanges or symbol == 'SAHARA':
+                upbit_data = await check_upbit_price(session, symbol)
+                cex_data['upbit'] = upbit_data
+            else:
+                cex_data['upbit'] = {'error': 'Not traded on Upbit'}
+            
+            # Проверка BitMart
+            if 'bitmart' in exchanges:
+                bitmart_data = await check_bitmart_price(session, symbol)
+                cex_data['bitmart'] = bitmart_data
+            else:
+                cex_data['bitmart'] = {'error': 'Not traded on BitMart'}
+            
+            # Проверка AscendEX
+            if 'ascendex' in exchanges:
+                ascendex_data = await check_ascendex_price(session, symbol)
+                cex_data['ascendex'] = ascendex_data
+            else:
+                cex_data['ascendex'] = {'error': 'Not traded on AscendEX'}
+            
+            # Проверка BingX
+            if 'bingx' in exchanges:
+                bingx_data = await check_bingx_price(session, symbol)
+                cex_data['bingx'] = bingx_data
+            else:
+                cex_data['bingx'] = {'error': 'Not traded on BingX'}
+            
+            # Проверка LBank
+            if 'lbank' in exchanges:
+                lbank_data = await check_lbank_price(session, symbol)
+                cex_data['lbank'] = lbank_data
+            else:
+                cex_data['lbank'] = {'error': 'Not traded on LBank'}
+            
+            # Проверка Bitget
+            if 'bitget' in exchanges:
+                bitget_data = await check_bitget_price(session, symbol)
+                cex_data['bitget'] = bitget_data
+            else:
+                cex_data['bitget'] = {'error': 'Not traded on Bitget'}
+            
+            # Проверка KuCoin
+            if 'kucoin' in exchanges:
+                kucoin_data = await check_kucoin_price(session, symbol)
+                cex_data['kucoin'] = kucoin_data
+            else:
+                cex_data['kucoin'] = {'error': 'Not traded on KuCoin'}
+            
+            # Проверка Kraken
+            if 'kraken' in exchanges:
+                kraken_data = await check_kraken_price(session, symbol)
+                cex_data['kraken'] = kraken_data
+            else:
+                cex_data['kraken'] = {'error': 'Not traded on Kraken'}
+            
+            # Проверка Bitunix
+            if 'bitunix' in exchanges:
+                bitunix_data = await check_bitunix_price(session, symbol)
+                cex_data['bitunix'] = bitunix_data
+            else:
+                cex_data['bitunix'] = {'error': 'Not traded on Bitunix'}
+            
+            # Проверка Raydium (DEX)
+            if 'raydium' in exchanges:
+                raydium_data = await check_raydium_price(session, symbol)
+                cex_data['raydium'] = raydium_data
+            else:
+                cex_data['raydium'] = {'error': 'Not traded on Raydium'}
+            
+            # Проверка Aerodrome (DEX)
+            if 'aerodrome' in exchanges:
+                aerodrome_data = await check_aerodrome_price(session, symbol)
+                cex_data['aerodrome'] = aerodrome_data
+            else:
+                cex_data['aerodrome'] = {'error': 'Not traded on Aerodrome'}
+            
             results[symbol] = cex_data
             
+            # Сохраняем данные в БД
+            if cex_data and not all('error' in str(v) for v in cex_data.values()):
+                # Находим лучшие данные (без ошибок)
+                best_data = {}
+                for exchange, data in cex_data.items():
+                    if isinstance(data, dict) and 'error' not in data:
+                        if 'price' in data:
+                            best_data['price'] = data['price']
+                        if 'volume_24h' in data:
+                            best_data['volume_24h'] = data['volume_24h']
+                        if 'market_cap' in data:
+                            best_data['market_cap'] = data['market_cap']
+                        break
+                
+                if best_data:
+                    save_token_data(symbol, best_data)
+                    logger.info(f"✅ Сохранены CEX данные для {symbol}: {best_data}")
+            
             logger.info(f"CEX данные для {symbol}: {results[symbol]}")
+            
+            # Проверяем алерты для этого токена
+            await check_alerts(symbol, {'cex': cex_data})
             
         except Exception as e:
             logger.error(f"Ошибка проверки CEX для {symbol}: {e}")
@@ -1184,11 +1915,301 @@ async def check_mexc_price(session: aiohttp.ClientSession, symbol: str) -> Dict[
     except Exception as e:
         return {'error': str(e)}
 
+async def check_binance_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Binance"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        params = {'symbol': f'{symbol}USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if 'lastPrice' in data:
+                    return {
+                        'price': float(data['lastPrice']),
+                        'volume_24h': float(data['volume']),
+                        'price_change_24h': float(data['priceChangePercent']),
+                        'high_24h': float(data['highPrice']),
+                        'low_24h': float(data['lowPrice'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_upbit_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Upbit"""
+    try:
+        url = "https://api.upbit.com/v1/ticker"
+        params = {'markets': f'KRW-{symbol}'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data and len(data) > 0:
+                    ticker = data[0]
+                    # Конвертируем KRW в USD (примерный курс)
+                    krw_to_usd = 0.00075  # Примерный курс
+                    return {
+                        'price': float(ticker['trade_price']) * krw_to_usd,
+                        'volume_24h': float(ticker['acc_trade_volume_24h']) * float(ticker['trade_price']) * krw_to_usd,
+                        'price_change_24h': float(ticker['signed_change_rate']) * 100,
+                        'high_24h': float(ticker['high_price']) * krw_to_usd,
+                        'low_24h': float(ticker['low_price']) * krw_to_usd
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_bitmart_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с BitMart"""
+    try:
+        url = "https://api-cloud.bitmart.com/spot/v1/ticker"
+        params = {'symbol': f'{symbol}_USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == 1000 and data.get('data'):
+                    ticker = data['data']
+                    return {
+                        'price': float(ticker['last_price']),
+                        'volume_24h': float(ticker['base_volume_24h']),
+                        'price_change_24h': float(ticker['fluctuation']),
+                        'high_24h': float(ticker['high_24h']),
+                        'low_24h': float(ticker['low_24h'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_ascendex_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с AscendEX"""
+    try:
+        url = "https://ascendex.com/api/pro/v1/ticker"
+        params = {'symbol': f'{symbol}/USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == 0 and data.get('data'):
+                    ticker = data['data']
+                    return {
+                        'price': float(ticker['close']),
+                        'volume_24h': float(ticker['volume']),
+                        'price_change_24h': float(ticker['change']),
+                        'high_24h': float(ticker['high']),
+                        'low_24h': float(ticker['low'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_bingx_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с BingX"""
+    try:
+        url = "https://open-api.bingx.com/openApi/spot/v1/ticker/24hr"
+        params = {'symbol': f'{symbol}USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == 0 and data.get('data'):
+                    ticker = data['data']
+                    return {
+                        'price': float(ticker['lastPrice']),
+                        'volume_24h': float(ticker['volume']),
+                        'price_change_24h': float(ticker['priceChangePercent']),
+                        'high_24h': float(ticker['highPrice']),
+                        'low_24h': float(ticker['lowPrice'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_lbank_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с LBank"""
+    try:
+        url = "https://api.lbank.info/v2/ticker.do"
+        params = {'symbol': f'{symbol}_usdt'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('result') and len(data['result']) > 0:
+                    ticker = data['result'][0]
+                    return {
+                        'price': float(ticker['ticker']['latest']),
+                        'volume_24h': float(ticker['ticker']['vol']),
+                        'price_change_24h': float(ticker['ticker']['change']),
+                        'high_24h': float(ticker['ticker']['high']),
+                        'low_24h': float(ticker['ticker']['low'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_bitget_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Bitget"""
+    try:
+        url = "https://api.bitget.com/api/spot/v1/market/ticker"
+        params = {'symbol': f'{symbol}USDT_SPBL'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == '00000' and data.get('data'):
+                    ticker = data['data']
+                    return {
+                        'price': float(ticker['last']),
+                        'volume_24h': float(ticker['baseVolume']),
+                        'price_change_24h': float(ticker['usdtRate']),
+                        'high_24h': float(ticker['high24h']),
+                        'low_24h': float(ticker['low24h'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_kucoin_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с KuCoin"""
+    try:
+        url = "https://api.kucoin.com/api/v1/market/orderbook/level1"
+        params = {'symbol': f'{symbol}-USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == '200000' and data.get('data'):
+                    ticker = data['data']
+                    return {
+                        'price': float(ticker['price']),
+                        'volume_24h': float(ticker.get('size', 0)),
+                        'price_change_24h': 0,  # KuCoin не предоставляет изменение цены в этом endpoint
+                        'high_24h': 0,
+                        'low_24h': 0
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_kraken_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Kraken"""
+    try:
+        url = "https://api.kraken.com/0/public/Ticker"
+        params = {'pair': f'{symbol}USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('error') == [] and data.get('result'):
+                    ticker_key = list(data['result'].keys())[0]
+                    ticker = data['result'][ticker_key]
+                    return {
+                        'price': float(ticker['c'][0]),
+                        'volume_24h': float(ticker['v'][1]),
+                        'price_change_24h': float(ticker['p'][1]) - float(ticker['p'][0]),
+                        'high_24h': float(ticker['h'][1]),
+                        'low_24h': float(ticker['l'][1])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_bitunix_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Bitunix"""
+    try:
+        url = "https://api.bitunix.com/api/v1/market/ticker"
+        params = {'symbol': f'{symbol}USDT'}
+        
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == 0 and data.get('data'):
+                    ticker = data['data']
+                    return {
+                        'price': float(ticker['last']),
+                        'volume_24h': float(ticker['volume']),
+                        'price_change_24h': float(ticker['change']),
+                        'high_24h': float(ticker['high']),
+                        'low_24h': float(ticker['low'])
+                    }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_raydium_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Raydium (DEX)"""
+    try:
+        # Raydium API для получения данных о пулах
+        url = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json"
+        
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                # Ищем пул для токена
+                for pool in data.get('official', []):
+                    if symbol in pool.get('name', ''):
+                        return {
+                            'price': float(pool.get('price', 0)),
+                            'volume_24h': float(pool.get('volume24h', 0)),
+                            'price_change_24h': 0,  # Raydium не предоставляет изменение цены
+                            'high_24h': 0,
+                            'low_24h': 0
+                        }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+async def check_aerodrome_price(session: aiohttp.ClientSession, symbol: str) -> Dict[str, Any]:
+    """Получение данных с Aerodrome (Base DEX)"""
+    try:
+        # Aerodrome API для получения данных о пулах
+        url = "https://api.aerodrome.finance/v1/pools"
+        
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                # Ищем пул для токена
+                for pool in data:
+                    if symbol in pool.get('token0_symbol', '') or symbol in pool.get('token1_symbol', ''):
+                        return {
+                            'price': float(pool.get('token0_price', 0)),
+                            'volume_24h': float(pool.get('volume_24h', 0)),
+                            'price_change_24h': 0,  # Aerodrome не предоставляет изменение цены
+                            'high_24h': 0,
+                            'low_24h': 0
+                        }
+            return {'error': f'HTTP {response.status}'}
+    except Exception as e:
+        return {'error': str(e)}
+
 # Кэш для DEX данных
 DEX_CACHE = {}
 DEX_CACHE_TTL = 300  # 5 минут
 
+async def dex_loop(session: aiohttp.ClientSession):
+    """Бесконечный цикл мониторинга DEX данных"""
+    logger.info("🔄 Запуск DEX мониторинга в цикле...")
+    while True:
+        try:
+            logger.info("🔄 Проверка данных DEX...")
+            result = await check_dex(session)
+            
+            # Детальное логирование результатов
+            for symbol, data in result.items():
+                if 'error' not in str(data):
+                    logger.info(f"✅ DEX данные для {symbol}: {data}")
+                else:
+                    logger.warning(f"⚠️ DEX ошибка для {symbol}: {data}")
+            
+            await asyncio.sleep(config.monitoring_config['check_interval'])
+        except Exception as e:
+            logger.error(f"❌ Ошибка в dex_loop: {e}")
+            await asyncio.sleep(30)
+
 @handle_errors("check_dex")
+@performance_decorator("check_dex")
+@recovery_decorator("dex_monitor")
 async def check_dex(session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
     Проверка данных DEX (DefiLlama, Dexscreener, GeckoTerminal)
@@ -1235,7 +2256,31 @@ async def check_dex(session: aiohttp.ClientSession) -> Dict[str, Any]:
             }
             
             results[symbol] = dex_result
+            
+            # Сохраняем данные в БД
+            if dex_result and not all('error' in str(v) for v in dex_result.values()):
+                # Находим лучшие данные (без ошибок)
+                best_data = {}
+                for dex_name, data in dex_result.items():
+                    if isinstance(data, dict) and 'error' not in data:
+                        if 'price' in data:
+                            best_data['price'] = data['price']
+                        if 'volume_24h' in data:
+                            best_data['volume_24h'] = data['volume_24h']
+                        if 'tvl' in data:
+                            best_data['tvl'] = data['tvl']
+                        if 'liquidity_usd' in data:
+                            best_data['liquidity_usd'] = data['liquidity_usd']
+                        break
+                
+                if best_data:
+                    save_token_data(symbol, best_data)
+                    logger.info(f"✅ Сохранены DEX данные для {symbol}: {best_data}")
+            
             logger.info(f"DEX данные для {symbol}: {results[symbol]}")
+            
+            # Проверяем алерты для этого токена
+            await check_alerts(symbol, {'dex': dex_result})
             
         except Exception as e:
             logger.error(f"Ошибка проверки DEX для {symbol}: {e}")
@@ -1335,7 +2380,22 @@ async def check_defillama_tvl(session: aiohttp.ClientSession, token: Dict) -> Di
         logger.error(f"Ошибка DefiLlama для {token['symbol']}: {e}")
         return {'error': 'Failed to fetch data'}
 
+async def social_loop(session: aiohttp.ClientSession = None):
+    """Бесконечный цикл мониторинга социальных сетей"""
+    logger.info("📱 Запуск социального мониторинга в цикле...")
+    while True:
+        try:
+            logger.info("📱 Проверка социальных сетей...")
+            result = await check_social(session)
+            logger.info(f"✅ Социальный мониторинг завершен: {result}")
+            await asyncio.sleep(config.social_config.get('fetch_interval', 900))  # 15 минут по умолчанию
+        except Exception as e:
+            logger.error(f"❌ Ошибка в social_loop: {e}")
+            await asyncio.sleep(60)
+
 @handle_errors("check_social")
+@performance_decorator("check_social")
+@recovery_decorator("social_monitor")
 async def check_social(session: aiohttp.ClientSession = None):
     """
     Проверка социальных данных (Twitter, Telegram, Discord)
@@ -1348,10 +2408,12 @@ async def check_social(session: aiohttp.ClientSession = None):
         telegram_api_hash = os.getenv('TELEGRAM_API_HASH')
         telegram_phone = os.getenv('TELEGRAM_PHONE')
         discord_bot_token = os.getenv('DISCORD_BOT_TOKEN')
+        discord_user_token = os.getenv('DISCORD_USER_TOKEN')
         
         has_telegram_api = (telegram_api_id and telegram_api_hash and telegram_phone and 
                            telegram_api_id != 'your_telegram_api_id_here')
-        has_discord_token = (discord_bot_token and discord_bot_token != 'your_discord_bot_token_here')
+        has_discord_token = ((discord_bot_token and discord_bot_token != 'your_discord_bot_token_here') or
+                            (discord_user_token and discord_user_token != 'your_discord_user_token_here'))
         
         tasks = []
         
@@ -1366,11 +2428,13 @@ async def check_social(session: aiohttp.ClientSession = None):
         
         # Discord (только если есть токен)
         if has_discord_token:
+            logger.info("[SOCIAL] Discord токен найден, запускаем мониторинг")
             tasks.append(check_discord())
         else:
             logger.info("[SOCIAL] Discord токен не настроен, пропускаем")
         
         # GitHub (всегда доступен)
+        logger.info("[SOCIAL] Запускаем GitHub мониторинг")
         tasks.append(check_github())
         
         # Запускаем доступные задачи
@@ -1386,6 +2450,10 @@ async def check_social(session: aiohttp.ClientSession = None):
 
 def translate_text(text: str, dest: str = 'en') -> str:
     """Перевод текста с помощью googletrans"""
+    if not TRANSLATOR_AVAILABLE:
+        logger.warning("Перевод недоступен, возвращаем оригинальный текст")
+        return text
+    
     try:
         translator = Translator()
         result = translator.translate(text, dest=dest)
@@ -1645,8 +2713,6 @@ def mark_tweet_as_processed(tweet_hash: str):
     except Exception as e:
         log_error("Twitter мониторинг", e)
 
-# Удалена функция check_twitter_fallback - больше не используем fallback механизмы
-
 async def check_telegram():
     """Мониторинг Telegram через Telethon"""
     try:
@@ -1734,13 +2800,19 @@ async def check_telegram():
         logger.error(f"[SOCIAL] Telegram monitoring error: {e}")
 
 async def check_discord():
-    """Мониторинг Discord как селфбот через discord.py-self"""
+    """Улучшенный мониторинг Discord с AI-анализом"""
     try:
+        logger.info("🔍 [DISCORD] Начинаем мониторинг Discord серверов...")
+        
         # Получаем user token из конфигурации
         discord_token = config.social_config.get('discord_token')
         if not discord_token:
             logger.warning("Discord токен не настроен, пропускаем")
             return
+            
+        # Временно отключаем Discord мониторинг из-за проблем с токеном
+        logger.warning("Discord мониторинг временно отключен из-за проблем с токеном")
+        return
 
         try:
             import discord
@@ -1748,84 +2820,272 @@ async def check_discord():
             logger.error("discord.py-self не установлен. Установите: pip3 install -U discord.py-self")
             return
 
+        # Проверяем формат токена
+        if not discord_token.startswith('MTA') and not discord_token.startswith('MTI'):
+            logger.error("Неверный формат Discord токена. Ожидается user token")
+            return
+
         # Инициализация клиента (селфбот)
         intents = discord.Intents.default()
         intents.messages = True
         intents.guilds = True
+        intents.message_content = True
+        intents.guild_messages = True
+        intents.direct_messages = True
+        
         client = discord.Client(intents=intents)
 
-        servers = config.social_config.get('discord_servers', [])
-        if not servers:
-            logger.info("Discord серверы не настроены")
-            return
+        # Целевые каналы для мониторинга
+        target_channels = [
+            'announcements', 'general', 'chat', 'community', 
+            'info', 'launch', 'news', 'updates', 'alpha', 'beta',
+            'testnet', 'mainnet', 'mint', 'airdrop', 'whitelist',
+            'trading', 'price', 'market', 'analysis'
+        ]
+        
+        # Кэш для отслеживания уже обработанных сообщений
+        cache_file = 'discord_messages_cache.json'
+        processed_messages = {}
+        
+        try:
+            with open(cache_file, 'r') as f:
+                processed_messages = json.load(f)
+        except FileNotFoundError:
+            processed_messages = {}
 
         done = False
+        messages_processed = 0
 
         @client.event
         async def on_ready():
-            nonlocal done
-            logger.info(f"Discord селфбот подключен как {client.user}")
+            nonlocal done, messages_processed
+            logger.info(f"🤖 Discord селфбот подключен как {client.user}")
+            
             try:
                 available_servers = client.guilds
-                logger.info(f"Доступные серверы: {[s.name for s in available_servers]}")
+                logger.info(f"📋 Доступные серверы: {[s.name for s in available_servers]}")
+                
                 for server in available_servers:
                     server_name_lower = server.name.lower()
-                    if any(keyword.lower() in server_name_lower for keyword in ['fuel', 'arc', 'crypto', 'blockchain']):
-                        logger.info(f"Мониторинг сервера: {server.name}")
+                    # Расширенная проверка релевантных серверов
+                    relevant_keywords = ['fuel', 'arc', 'crypto', 'blockchain', 'defi', 'nft', 'web3', 'dao']
+                    
+                    if any(keyword.lower() in server_name_lower for keyword in relevant_keywords):
+                        logger.info(f"🎯 Мониторинг сервера: {server.name}")
+                        
                         for channel in server.text_channels:
-                            try:
-                                messages = await channel.history(limit=20).flatten()
-                                for message in messages:
-                                    if not message.content:
-                                        continue
-                                    text = message.content.lower()
-                                    token_terms = [k.lower() for k in config.social_config['keywords']]
-                                    alert_terms = sum([config.social_config['alert_keywords'][lvl] for lvl in config.social_config['alert_keywords']], [])
-                                    if any(term in text for term in token_terms) and any(word in text for word in alert_terms):
-                                        level = None
-                                        for lvl, words in config.social_config['alert_keywords'].items():
-                                            if any(word in text for word in words):
-                                                level = lvl
-                                                break
-                                        if not level:
+                            if not isinstance(channel, discord.TextChannel):
+                                continue
+                                
+                            # Проверяем, является ли канал целевым
+                            channel_name_lower = channel.name.lower()
+                            is_target = any(target in channel_name_lower for target in target_channels)
+                            
+                            if is_target:
+                                logger.info(f"📢 Сканируем канал: {channel.name}")
+                                
+                                try:
+                                    # Получаем последние сообщения (увеличиваем лимит)
+                                    messages = await channel.history(limit=50).flatten()
+                                    
+                                    for message in messages:
+                                        if not message.content or len(message.content.strip()) < 10:
+                                            continue
+                                            
+                                        # Проверяем, не обрабатывали ли мы уже это сообщение
+                                        message_key = f"{server.id}_{channel.id}_{message.id}"
+                                        if message_key in processed_messages:
+                                            continue
+                                            
+                                        text = message.content.lower()
+                                        token_terms = [k.lower() for k in config.social_config['keywords']]
+                                        alert_terms = sum([config.social_config['alert_keywords'][lvl] for lvl in config.social_config['alert_keywords']], [])
+                                        
+                                        # Улучшенная логика определения важности
+                                        if any(term in text for term in token_terms):
+                                            # Определяем уровень важности
                                             level = 'INFO'
-                                        translated = translate_text(message.content, dest=config.social_config['translate_to'])
-                                        link = f"https://discord.com/channels/{server.id}/{channel.id}/{message.id}"
-                                        await send_social_alert(
-                                            level,
-                                            'Discord',
-                                            message.content,
-                                            translated,
-                                            link,
-                                            token='FUEL' if 'fuel' in text else ('ARC' if 'arc' in text else ('BID' if 'bid' in text or 'creatorbid' in text else ('MANTA' if 'manta' in text else ('ANON' if 'anon' in text or 'hey anon' in text else '')))),
-                                            keywords=[w for w in token_terms if w in text] + [w for w in alert_terms if w in text]
-                                        )
-                            except Exception as e:
-                                logger.error(f"Ошибка мониторинга канала {channel.name}: {e}")
+                                            for lvl, words in config.social_config['alert_keywords'].items():
+                                                if any(word in text for word in words):
+                                                    level = lvl.upper()
+                                                    break
+                                            
+                                            # AI-анализ важности сообщения
+                                            try:
+                                                ai_analysis = await analyze_discord_message_with_ai(message.content, server.name, channel.name)
+                                                if ai_analysis.get('should_alert', False):
+                                                    level = ai_analysis.get('level', level)
+                                                    logger.info(f"🤖 AI рекомендует уровень: {level}")
+                                            except Exception as e:
+                                                logger.warning(f"Ошибка AI-анализа Discord сообщения: {e}")
+                                            
+                                            # Переводим сообщение
+                                            translated = translate_text(message.content, dest=config.social_config['translate_to'])
+                                            
+                                            # Формируем ссылку
+                                            link = f"https://discord.com/channels/{server.id}/{channel.id}/{message.id}"
+                                            
+                                            # Определяем токен
+                                            token = ''
+                                            if 'fuel' in text:
+                                                token = 'FUEL'
+                                            elif 'arc' in text:
+                                                token = 'ARC'
+                                            elif 'bid' in text or 'creatorbid' in text:
+                                                token = 'BID'
+                                            elif 'manta' in text:
+                                                token = 'MANTA'
+                                            elif 'anon' in text or 'hey anon' in text:
+                                                token = 'ANON'
+                                            
+                                            # Отправляем алерт
+                                            await send_social_alert(
+                                                level,
+                                                'Discord',
+                                                message.content,
+                                                translated,
+                                                link,
+                                                token=token,
+                                                keywords=[w for w in token_terms if w in text] + [w for w in alert_terms if w in text]
+                                            )
+                                            
+                                            # Помечаем сообщение как обработанное
+                                            processed_messages[message_key] = {
+                                                'timestamp': datetime.now().isoformat(),
+                                                'level': level,
+                                                'server': server.name,
+                                                'channel': channel.name
+                                            }
+                                            
+                                            messages_processed += 1
+                                            
+                                except Exception as e:
+                                    logger.error(f"Ошибка мониторинга канала {channel.name}: {e}")
+                                    
             except Exception as e:
                 logger.error(f"Ошибка мониторинга Discord серверов: {e}")
             finally:
+                # Сохраняем кэш
+                try:
+                    with open(cache_file, 'w') as f:
+                        json.dump(processed_messages, f, indent=2)
+                except Exception as e:
+                    logger.error(f"Ошибка сохранения кэша Discord: {e}")
+                
+                logger.info(f"✅ Discord мониторинг завершен. Обработано сообщений: {messages_processed}")
                 done = True
                 await client.close()
 
+        # Улучшенное подключение с несколькими попытками
+        connection_success = False
+        
+        # Попытка 1: Стандартный способ
         try:
-            await client.start(discord_token, bot=False)
-            timeout = 30
+            logger.info("🔄 Попытка подключения к Discord (способ 1)...")
+            await client.start(discord_token)
+            connection_success = True
+        except Exception as e:
+            logger.warning(f"Способ 1 не удался: {e}")
+            
+            # Попытка 2: Альтернативный способ
+            try:
+                logger.info("🔄 Попытка подключения к Discord (способ 2)...")
+                await client.login(discord_token)
+                await client.connect()
+                connection_success = True
+            except Exception as e2:
+                logger.warning(f"Способ 2 не удался: {e2}")
+                
+                # Попытка 3: С дополнительными параметрами
+                try:
+                    logger.info("🔄 Попытка подключения к Discord (способ 3)...")
+                    client = discord.Client(intents=intents, self_bot=True)
+                    await client.start(discord_token)
+                    connection_success = True
+                except Exception as e3:
+                    logger.error(f"Все способы подключения не удались: {e3}")
+        
+        if connection_success:
+            timeout = 60
             start_time = time.time()
             while not done and (time.time() - start_time) < timeout:
                 await asyncio.sleep(1)
             if not done:
                 logger.warning("Discord мониторинг завершен по таймауту")
                 await client.close()
-        except Exception as e:
-            logger.error(f"Ошибка запуска Discord селфбота: {e}")
+        else:
+            logger.error("Не удалось подключиться к Discord")
+            
     except Exception as e:
         logger.error(f"[SOCIAL] Discord monitoring error: {e}")
+
+async def analyze_discord_message_with_ai(message_content: str, server_name: str, channel_name: str) -> Dict[str, Any]:
+    """AI-анализ важности Discord сообщения"""
+    try:
+        if not OPENAI_API_KEY or OPENAI_API_KEY == 'your_openai_api_key_here':
+            return {'should_alert': True, 'level': 'INFO'}
+        
+        prompt = f"""
+        Проанализируй это сообщение из Discord сервера криптовалютного проекта:
+
+        Сервер: {server_name}
+        Канал: {channel_name}
+        Сообщение: {message_content}
+
+        Оцени важность этого сообщения для криптовалют FUEL и ARC:
+
+        КРИТЕРИИ ВАЖНОСТИ:
+        - CRITICAL: анонсы релизов, критические обновления, проблемы безопасности
+        - HIGH: новые функции, партнерства, листинги, важные обновления
+        - MEDIUM: общие новости, обсуждения, технические детали
+        - LOW: обычные чаты, мемы, спам
+
+        Ответь в формате JSON:
+        {{
+            "should_alert": true/false,
+            "level": "CRITICAL/HIGH/MEDIUM/LOW",
+            "reason": "обоснование на русском"
+        }}
+        """
+        
+        response = await analyze_with_chatgpt(prompt, "discord_analysis")
+        
+        if response and 'choices' in response:
+            analysis_text = response['choices'][0]['message']['content']
+            try:
+                import json
+                import re
+                
+                # Убираем markdown обрамление если есть
+                cleaned_text = analysis_text.strip()
+                if cleaned_text.startswith('```json'):
+                    cleaned_text = cleaned_text[7:]  # Убираем ```json
+                if cleaned_text.startswith('```'):
+                    cleaned_text = cleaned_text[3:]  # Убираем ```
+                if cleaned_text.endswith('```'):
+                    cleaned_text = cleaned_text[:-3]  # Убираем ```
+                
+                cleaned_text = cleaned_text.strip()
+                
+                analysis = json.loads(cleaned_text)
+                return analysis
+            except json.JSONDecodeError:
+                logger.error(f"Ошибка парсинга JSON от ChatGPT для Discord: {analysis_text}")
+                return {'should_alert': True, 'level': 'INFO'}
+        else:
+            return {'should_alert': True, 'level': 'INFO'}
+            
+    except Exception as e:
+        logger.error(f"Ошибка AI-анализа Discord сообщения: {e}")
+        return {'should_alert': True, 'level': 'INFO'}
 
 async def analyze_github_changes_with_ai(commit_data: Dict[str, Any], repo_info: Dict[str, str]) -> Dict[str, Any]:
     """AI анализ изменений в GitHub с помощью OpenAI"""
     try:
+        logger.info(f"🤖 Начинаем AI анализ коммита {commit_data['sha'][:8]} в {repo_info['owner']}/{repo_info['repo']}")
+        
         if not OPENAI_API_KEY or OPENAI_API_KEY == 'your_openai_api_key_here':
+            logger.warning("❌ [GITHUB AI] OpenAI API ключ не настроен")
             return {
                 'importance': 'low',
                 'summary': 'AI анализ недоступен - нет API ключа',
@@ -1886,18 +3146,34 @@ async def analyze_github_changes_with_ai(commit_data: Dict[str, Any], repo_info:
         }}
         """
         
+        logger.info("📤 Отправляем запрос в OpenAI...")
         response = await analyze_with_chatgpt(prompt, "github_analysis")
         
         if response and 'choices' in response:
             analysis_text = response['choices'][0]['message']['content']
+            logger.info(f"📥 Получен ответ от OpenAI: {analysis_text[:200]}...")
             
             try:
-                # Парсим JSON ответ
+                # Парсим JSON ответ (обрабатываем markdown формат)
                 import json
-                analysis = json.loads(analysis_text)
+                import re
+                
+                # Убираем markdown обрамление если есть
+                cleaned_text = analysis_text.strip()
+                if cleaned_text.startswith('```json'):
+                    cleaned_text = cleaned_text[7:]  # Убираем ```json
+                if cleaned_text.startswith('```'):
+                    cleaned_text = cleaned_text[3:]  # Убираем ```
+                if cleaned_text.endswith('```'):
+                    cleaned_text = cleaned_text[:-3]  # Убираем ```
+                
+                cleaned_text = cleaned_text.strip()
+                
+                analysis = json.loads(cleaned_text)
+                logger.info(f"✅ AI анализ успешен: важность={analysis.get('importance')}, влияние={analysis.get('impact')}")
                 return analysis
             except json.JSONDecodeError:
-                logger.error(f"Ошибка парсинга JSON от ChatGPT: {analysis_text}")
+                logger.error(f"❌ Ошибка парсинга JSON от ChatGPT: {analysis_text}")
                 return {
                     'importance': 'medium',
                     'summary': 'Ошибка AI анализа',
@@ -1906,6 +3182,7 @@ async def analyze_github_changes_with_ai(commit_data: Dict[str, Any], repo_info:
                     'reason': 'AI analysis failed'
                 }
         else:
+            logger.warning("⚠️ OpenAI не вернул ответ")
             return {
                 'importance': 'medium',
                 'summary': 'AI анализ недоступен',
@@ -1927,7 +3204,7 @@ async def analyze_github_changes_with_ai(commit_data: Dict[str, Any], repo_info:
 async def check_github():
     """Мониторинг GitHub репозиториев с AI анализом"""
     try:
-        logger.info("Проверка GitHub репозиториев с AI анализом...")
+        logger.info("🔍 [GITHUB] Начинаем мониторинг GitHub репозиториев...")
         
         # Получаем список GitHub аккаунтов для мониторинга
         github_accounts = config.social_config.get('github_accounts', [])
@@ -2004,6 +3281,7 @@ async def check_github():
                                             
                                             # AI анализ важности изменений
                                             ai_analysis = await analyze_github_changes_with_ai(detailed_commit, repo_info)
+                                            logger.info(f"📊 Результат AI анализа: {ai_analysis}")
                                             
                                             # Проверяем, нужно ли отправлять алерт
                                             if ai_analysis.get('should_alert', False):
@@ -2036,20 +3314,19 @@ async def check_github():
                                                     'neutral': '📝'
                                                 }.get(impact, '📝')
                                                 
-                                                # Формируем сообщение
-                                                alert_message = f"{impact_emoji} <b>{level} - GITHUB UPDATE</b>\n\n"
-                                                alert_message += f"<b>Репозиторий:</b> {owner}/{repo}\n"
-                                                alert_message += f"<b>Важность:</b> {importance.upper()}\n"
-                                                alert_message += f"<b>Влияние:</b> {impact.upper()}\n\n"
-                                                alert_message += f"<b>AI Анализ:</b>\n{ai_summary}\n\n"
+                                                # Формируем короткое сообщение
+                                                impact_emoji = {
+                                                    'positive': '🚀',
+                                                    'negative': '⚠️',
+                                                    'neutral': '📝'
+                                                }.get(impact, '📝')
                                                 
-                                                if technical_details:
-                                                    alert_message += f"<b>Технические детали:</b>\n{technical_details}\n\n"
+                                                # Короткое резюме на русском
+                                                short_summary = ai_summary[:200] + "..." if len(ai_summary) > 200 else ai_summary
                                                 
-                                                alert_message += f"<b>Обоснование:</b>\n{ai_reason}\n\n"
-                                                alert_message += f"<b>Коммит:</b>\n{commit_message}\n\n"
-                                                alert_message += f"<b>Перевод:</b>\n{translated}\n\n"
-                                                alert_message += f"<b>Ссылка:</b> {commit_link}"
+                                                alert_message = f"{impact_emoji} <b>GitHub: {owner}/{repo}</b>\n\n"
+                                                alert_message += f"{short_summary}\n\n"
+                                                alert_message += f"🔗 {commit_link}"
                                                 
                                                 # Отправляем в Telegram
                                                 await send_github_alert(alert_message, level, commit_link, repo_info)
@@ -2217,7 +3494,29 @@ async def send_social_alert(level: str, source: str, original_text: str, transla
     except Exception as e:
         logger.error(f"Ошибка отправки социального алерта: {e}")
 
+async def analytics_loop(session: aiohttp.ClientSession):
+    """Бесконечный цикл мониторинга аналитики"""
+    logger.info("📈 Запуск аналитического мониторинга в цикле...")
+    while True:
+        try:
+            logger.info("📈 Проверка аналитических данных...")
+            result = await check_analytics(session)
+            
+            # Детальное логирование результатов
+            for symbol, data in result.items():
+                if 'error' not in str(data):
+                    logger.info(f"✅ Аналитика для {symbol}: {data}")
+                else:
+                    logger.warning(f"⚠️ Аналитика ошибка для {symbol}: {data}")
+            
+            await asyncio.sleep(config.monitoring_config['check_interval'] * 2)  # Аналитика реже
+        except Exception as e:
+            logger.error(f"❌ Ошибка в analytics_loop: {e}")
+            await asyncio.sleep(60)
+
 @handle_errors("check_analytics")
+@performance_decorator("check_analytics")
+@recovery_decorator("analytics_monitor")
 async def check_analytics(session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
     Проверка аналитических данных (DeBank, Arkham, BubbleMaps)
@@ -2449,56 +3748,91 @@ async def get_crypto_news(symbol: str) -> str:
         return f"📊 Мониторинг {symbol} активен"
 
 @handle_errors("send_alert")
+@performance_decorator("send_alert")
 async def send_alert(level, message, token_symbol=None, context=None):
     """
-    Отправка алерта в Telegram и push (Pushover)
+    Отправка алерта с использованием нового менеджера алертов
     """
     try:
-        logger.debug(f"Подготовка алерта: уровень={level}, токен={token_symbol}, контекст={context}")
+        logger.debug(f"Подготовка алерта: уровень={level}, токен={token_symbol}")
         
-        # Формирование сообщения
-        if context and 'price' in context and 'volume_24h' in context:
-            message = f"{message}\n💰 Цена: ${context['price']:.6f}\n📊 Объем 24ч: ${context['volume_24h']:,.0f}"
-        
-        # AI улучшение алерта (пока отключено)
-        # if context:
-        #     enhanced_message = await generate_ai_alert(message, context)
-        #     if enhanced_message:
-        #         message = enhanced_message
-        #         logger.debug("Алерт улучшен с помощью AI")
-        
-        # Отправка в Telegram
-        telegram_url = f"https://api.telegram.org/bot{config.api_config['telegram']['bot_token']}/sendMessage"
-        payload = {
-            'chat_id': config.api_config['telegram']['chat_id'],
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        
-        logger.debug(f"Отправка в Telegram: {payload}")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(telegram_url, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    logger.debug(f"Telegram ответ: {result}")
-                    logger.info(f"Алерт отправлен: {message}")
-                else:
-                    logger.error(f"Ошибка отправки в Telegram: {response.status}")
-        
-        # Сохранение в БД
-        with sqlite3.connect(DB_PATH) as conn:
-            with conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO alerts (level, message, token_symbol)
-                    VALUES (?, ?, ?)
-                ''', (level, message, token_symbol))
-        
-        logger.debug(f"Алерт сохранен в БД: {level} - {token_symbol}")
-        
-        # Отправка push-уведомления для критических алертов
-        if level == 'CRITICAL':
-            send_mobile_alert(level, message)
+        # Используем новый менеджер алертов если доступен
+        if NEW_MODULES_AVAILABLE:
+            # Преобразуем уровень в AlertLevel
+            alert_level_map = {
+                'INFO': AlertLevel.INFO,
+                'WARNING': AlertLevel.WARNING,
+                'ERROR': AlertLevel.ERROR,
+                'CRITICAL': AlertLevel.CRITICAL
+            }
+            
+            alert_level = alert_level_map.get(level, AlertLevel.INFO)
+            
+            # Формирование сообщения
+            if context and 'price' in context and 'volume_24h' in context:
+                message = f"{message}\n💰 Цена: ${context['price']:.6f}\n📊 Объем 24ч: ${context['volume_24h']:,.0f}"
+            
+            # Отправляем через новый менеджер
+            success = await send_alert(
+                level=alert_level,
+                title=f"Алерт {level}",
+                message=message,
+                token_symbol=token_symbol,
+                source="monitor",
+                channels=[AlertChannel.TELEGRAM, AlertChannel.CONSOLE]
+            )
+            
+            if success:
+                logger.info(f"✅ Алерт отправлен через новый менеджер: {message[:100]}...")
+            else:
+                logger.warning(f"⚠️ Не удалось отправить алерт через новый менеджер")
+                
+        else:
+            # Fallback на старую логику
+            logger.debug("Используется fallback логика отправки алертов")
+            
+            # Улучшенная проверка на дублирование алертов
+            base_message = message.split('\n')[0]
+            alert_hash = hashlib.md5(f"{level}_{token_symbol}_{base_message}".encode()).hexdigest()
+            cache_key = f"alert_{alert_hash}"
+            current_time = time.time()
+            
+            # Проверяем кэш
+            if cache_key in alert_cache:
+                last_time = alert_cache[cache_key]
+                block_time = 1800 if level == 'INFO' else (3600 if level == 'WARNING' else 7200)
+                if current_time - last_time < block_time:
+                    logger.debug(f"Алерт заблокирован кэшем: {base_message[:50]}...")
+                    return
+            
+            # Формирование сообщения
+            if context and 'price' in context and 'volume_24h' in context:
+                message = f"{message}\n💰 Цена: ${context['price']:.6f}\n📊 Объем 24ч: ${context['volume_24h']:,.0f}"
+            
+            # Отправка в Telegram
+            telegram_url = f"https://api.telegram.org/bot{config.api_config['telegram']['bot_token']}/sendMessage"
+            payload = {
+                'chat_id': config.api_config['telegram']['chat_id'],
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(telegram_url, json=payload) as response:
+                    if response.status == 200:
+                        logger.info(f"✅ Алерт отправлен: {base_message[:100]}...")
+                        alert_cache[cache_key] = current_time
+                    else:
+                        logger.error(f"Ошибка отправки в Telegram: {response.status}")
+            
+            # Сохранение в БД
+            with sqlite3.connect(DB_PATH) as conn:
+                with conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO alerts (level, message, token_symbol)
+                        VALUES (?, ?, ?)
+                    ''', (level, message, token_symbol))
         
     except Exception as e:
         logger.error(f"Ошибка отправки алерта: {e}")
@@ -2545,17 +3879,34 @@ def get_last_volume(symbol: str, minutes: int = 60) -> float:
         return 0.0
 
 def was_alert_sent(symbol: str, volume: float, threshold: float = 0.01) -> bool:
-    """Проверяет, был ли отправлен алерт по объему"""
+    """Проверяет, был ли отправлен алерт по объему (улучшенная версия)"""
     try:
+        cache_key = f"{symbol}_volume_{int(volume)}"
+        current_time = time.time()
+        
+        # Проверяем кэш
+        if cache_key in alert_cache:
+            last_time = alert_cache[cache_key]
+            # Не отправляем повторный алерт в течение 30 минут
+            if current_time - last_time < 1800:  # 30 минут
+                return True
+        
+        # Проверяем БД
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT COUNT(*) FROM alerts
                 WHERE token_symbol = ? AND message LIKE ?
-                AND timestamp >= datetime('now', '-1 hour')
-            ''', (symbol, f'%{volume}%'))
+                AND timestamp >= datetime('now', '-30 minutes')
+            ''', (symbol, f'%{volume:.0f}%'))
             count = cursor.fetchone()[0]
-            return count > 0
+            
+            if count > 0:
+                # Кэшируем результат
+                alert_cache[cache_key] = current_time
+                return True
+                
+        return False
     except Exception as e:
         logger.error(f"Ошибка проверки алерта по объему: {e}")
         return False
@@ -2577,107 +3928,315 @@ def get_last_price(symbol: str, minutes: int = 60) -> float:
         return 0.0
 
 def was_price_alert_sent(symbol: str, price: float, threshold: float = 0.01) -> bool:
-    """Проверяет, был ли отправлен алерт по цене"""
+    """Проверяет, был ли отправлен алерт по цене (улучшенная версия)"""
     try:
+        cache_key = f"{symbol}_price_{int(price * 1000000)}"  # Умножаем на 1M для точности
+        current_time = time.time()
+        
+        # Проверяем кэш
+        if cache_key in alert_cache:
+            last_time = alert_cache[cache_key]
+            # Не отправляем повторный алерт в течение 15 минут
+            if current_time - last_time < 900:  # 15 минут
+                return True
+        
+        # Проверяем БД
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT COUNT(*) FROM alerts
                 WHERE token_symbol = ? AND message LIKE ?
-                AND timestamp >= datetime('now', '-1 hour')
-            ''', (symbol, f'%{price}%'))
+                AND timestamp >= datetime('now', '-15 minutes')
+            ''', (symbol, f'%{price:.6f}%'))
             count = cursor.fetchone()[0]
-            return count > 0
+            
+            if count > 0:
+                # Кэшируем результат
+                alert_cache[cache_key] = current_time
+                return True
+                
+        return False
     except Exception as e:
         logger.error(f"Ошибка проверки алерта по цене: {e}")
         return False
 
+def was_recent_alert_sent(symbol: str, alert_type: str, minutes: int = 30) -> bool:
+    """Проверяет, был ли отправлен алерт определенного типа недавно"""
+    try:
+        cache_key = f"{symbol}_{alert_type}"
+        current_time = time.time()
+        
+        # Проверяем кэш
+        if cache_key in last_alert_time:
+            last_time = last_alert_time[cache_key]
+            if current_time - last_time < minutes * 60:
+                logger.debug(f"Алерт {alert_type} для {symbol} заблокирован кэшем")
+                return True
+        
+        # Проверяем БД с более точным запросом
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM alerts
+                WHERE token_symbol = ? AND level = ?
+                AND timestamp >= datetime('now', ? || ' minutes')
+                ORDER BY timestamp DESC
+            ''', (symbol, alert_type, -minutes))
+            count = cursor.fetchone()[0]
+            
+            if count > 0:
+                last_alert_time[cache_key] = current_time
+                logger.debug(f"Алерт {alert_type} для {symbol} найден в БД ({count} записей)")
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки недавних алертов: {e}")
+        return False
+
 # --- Изменяем check_alerts ---
 async def check_alerts(symbol: str, data: Dict[str, Any]):
-    """Проверка условий для алертов (теперь с динамической точкой отсчёта)"""
+    """Проверка условий для алертов с новой логикой пиковых значений"""
     try:
-        logger.debug(f"Проверка алертов для {symbol}: {data}")
+        logger.debug(f"Проверка алертов для {symbol}")
         
-        # Получаем текущие данные
-        current_price = 0
-        current_volume = 0
+        # Собираем все доступные данные с указанием источника
+        available_data = []
         
-        # Приоритет: CEX > DEX > realtime_data
+        # Проверяем CEX данные
         if 'cex' in data and data['cex']:
             for exchange, exchange_data in data['cex'].items():
                 if isinstance(exchange_data, dict) and 'error' not in exchange_data:
-                    if 'price' in exchange_data:
-                        current_price = float(exchange_data['price'])
-                    if 'volume_24h' in exchange_data:
-                        current_volume = float(exchange_data['volume_24h'])
-                    break
+                    if 'price' in exchange_data and 'volume_24h' in exchange_data:
+                        try:
+                            # Безопасное преобразование в float с валидацией
+                            price_raw = exchange_data['price']
+                            volume_raw = exchange_data['volume_24h']
+                            
+                            # Проверяем, что данные не являются строками с текстом
+                            if isinstance(price_raw, str) and not price_raw.replace('.', '').replace('-', '').isdigit():
+                                logger.warning(f"Некорректная цена для {symbol} с {exchange}: {price_raw}")
+                                continue
+                                
+                            if isinstance(volume_raw, str) and not volume_raw.replace('.', '').replace('-', '').isdigit():
+                                logger.warning(f"Некорректный объем для {symbol} с {exchange}: {volume_raw}")
+                                continue
+                            
+                            price = float(price_raw)
+                            volume = float(volume_raw)
+                            
+                            # Валидация данных
+                            if price > 0 and volume > 0:
+                                available_data.append({
+                                    'source': f"cex_{exchange}",
+                                    'price': price,
+                                    'volume': volume,
+                                    'data': exchange_data
+                                })
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Ошибка преобразования данных для {symbol} с {exchange}: {e}")
+                            continue
         
-        if current_price == 0 and 'dex' in data and data['dex']:
+        # Проверяем DEX данные
+        if 'dex' in data and data['dex']:
             for dex_name, dex_data in data['dex'].items():
                 if isinstance(dex_data, dict) and 'error' not in dex_data:
-                    if 'price' in dex_data:
-                        current_price = float(dex_data['price'])
-                    if 'volume_24h' in dex_data:
-                        current_volume = float(dex_data['volume_24h'])
-                    break
+                    if 'price' in dex_data and 'volume_24h' in dex_data:
+                        try:
+                            # Безопасное преобразование в float с валидацией
+                            price_raw = dex_data['price']
+                            volume_raw = dex_data['volume_24h']
+                            
+                            # Проверяем, что данные не являются строками с текстом
+                            if isinstance(price_raw, str) and not price_raw.replace('.', '').replace('-', '').isdigit():
+                                logger.warning(f"Некорректная цена DEX для {symbol} с {dex_name}: {price_raw}")
+                                continue
+                                
+                            if isinstance(volume_raw, str) and not volume_raw.replace('.', '').replace('-', '').isdigit():
+                                logger.warning(f"Некорректный объем DEX для {symbol} с {dex_name}: {volume_raw}")
+                                continue
+                            
+                            price = float(price_raw)
+                            volume = float(volume_raw)
+                            
+                            if price > 0 and volume > 0:
+                                available_data.append({
+                                    'source': f"dex_{dex_name}",
+                                    'price': price,
+                                    'volume': volume,
+                                    'data': dex_data
+                                })
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Ошибка преобразования DEX данных для {symbol} с {dex_name}: {e}")
+                            continue
         
-        if current_price == 0 and symbol in realtime_data:
-            current_price = realtime_data[symbol].get('price', 0)
-            current_volume = realtime_data[symbol].get('volume_24h', 0)
+        # Проверяем realtime данные
+        if 'realtime_data' in data and data['realtime_data']:
+            realtime = data['realtime_data']
+            if 'price' in realtime and 'volume_24h' in realtime:
+                try:
+                    # Безопасное преобразование в float с валидацией
+                    price_raw = realtime['price']
+                    volume_raw = realtime['volume_24h']
+                    
+                    # Проверяем, что данные не являются строками с текстом
+                    if isinstance(price_raw, str) and not price_raw.replace('.', '').replace('-', '').isdigit():
+                        logger.warning(f"Некорректная цена realtime для {symbol}: {price_raw}")
+                        return
+                        
+                    if isinstance(volume_raw, str) and not volume_raw.replace('.', '').replace('-', '').isdigit():
+                        logger.warning(f"Некорректный объем realtime для {symbol}: {volume_raw}")
+                        return
+                    
+                    price = float(price_raw)
+                    volume = float(volume_raw)
+                    
+                    if price > 0 and volume > 0:
+                        available_data.append({
+                            'source': 'realtime',
+                            'price': price,
+                            'volume': volume,
+                            'data': realtime
+                        })
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Ошибка преобразования realtime данных для {symbol}: {e}")
+                    return
         
-        logger.debug(f"Текущие данные {symbol}: цена=${current_price}, объем=${current_volume}")
-        
-        if current_price == 0 and current_volume == 0:
-            logger.debug(f"Нет валидных данных для {symbol}, пропуск алертов")
+        if not available_data:
+            logger.debug(f"Нет валидных данных для {symbol}")
             return
         
-        # Получаем точку отсчёта
-        reference = get_alert_reference(symbol)
-        if reference:
-            last_price = reference['last_price']
-            last_volume = reference['last_volume']
-            logger.debug(f"Точка отсчёта {symbol}: цена=${last_price}, объем=${last_volume}")
-        else:
-            last_price = current_price
-            last_volume = current_volume
-            logger.debug(f"Нет точки отсчёта для {symbol}, используем текущие значения")
+        # Суммируем объем со всех бирж
+        total_volume = sum(data['volume'] for data in available_data)
         
-        # Проверка изменения цены
-        if last_price > 0:
-            price_change = abs((current_price - last_price) / last_price) * 100
-            logger.debug(f"Изменение цены {symbol}: {price_change:.2f}%")
+        # Выбираем цену с биржи, где максимальный объем (как репрезентативную)
+        best_data = max(available_data, key=lambda x: x['volume'])
+        current_price = best_data['price']
+        current_volume = total_volume  # Используем суммарный объем
+        best_exchange = "all_exchanges"  # Указываем, что это суммарные данные
+        
+        logger.debug(f"Суммарные данные для {symbol}: цена с {best_data['source']} = ${current_price}, общий объем = ${current_volume:,.0f}")
+        
+        # Получаем пиковые значения
+        peak = get_peak_values(symbol)
+        current_time = int(time.time())
+        
+        # Инициализация пиковых значений при первом запуске
+        if peak['last_alert_time'] == 0:
+            set_peak_values(symbol, current_price, current_volume)
+            logger.debug(f"Инициализированы пиковые значения для {symbol}: цена=${current_price}, объем=${current_volume}")
+            return
+        
+        # Проверяем, нужно ли обновить пиковые значения
+        if should_update_peak(symbol, current_price, current_volume):
+            set_peak_values(symbol, current_price, current_volume)
+            logger.debug(f"Обновлены пиковые значения для {symbol}: цена=${current_price}, объем=${current_volume}")
+        
+        # Проверка изменения цены относительно последнего алерта
+        if peak['last_price_alert'] > 0:
+            price_change = calculate_relative_change(current_price, peak['last_price_alert'])
+            logger.debug(f"Относительное изменение цены {symbol}: {price_change:.2f}% (от ${peak['last_price_alert']:.6f} до ${current_price:.6f})")
             
-            if price_change > config.monitoring_config['price_change_threshold']:
-                if not was_price_alert_sent(symbol, current_price):
-                    alert_message = f"🚨 Резкое изменение цены {symbol}: {price_change:.2f}% (${last_price:.6f} → ${current_price:.6f})"
+            # Валидация изменения цены
+            if abs(price_change) > 50:  # Подозрительно большое изменение
+                logger.warning(f"Подозрительно большое изменение цены {symbol}: {price_change:.2f}% - пропускаем алерт")
+                return
+            
+            # Проверяем, прошло ли достаточно времени с последнего алерта
+            time_since_last_alert = current_time - peak['last_alert_time']
+            
+            # Пороги для алертов по цене (относительно последнего алерта)
+            if price_change > 20:  # CRITICAL - рост более 20% от последнего алерта
+                if time_since_last_alert > 1800:  # 30 минут
+                    alert_message = f"🚨🚨 КРИТИЧЕСКИЙ рост цены {symbol}: +{price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
+                    await send_alert('CRITICAL', alert_message, symbol, {
+                        'price': current_price,
+                        'volume_24h': current_volume,
+                        'price_change': price_change,
+                        'exchange': best_exchange
+                    })
+                    set_peak_values(symbol, current_price, current_volume, 'price')
+                    logger.info(f"Отправлен CRITICAL алерт по цене для {symbol}")
+                    
+            elif price_change > 12:  # WARNING - рост более 12% от последнего алерта
+                if time_since_last_alert > 900:  # 15 минут
+                    alert_message = f"🚨 Рост цены {symbol}: +{price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
                     await send_alert('WARNING', alert_message, symbol, {
                         'price': current_price,
                         'volume_24h': current_volume,
-                        'price_change': price_change
+                        'price_change': price_change,
+                        'exchange': best_exchange
                     })
-                    logger.debug(f"Отправлен алерт по цене для {symbol}")
-        
-        # Проверка изменения объема
-        if last_volume > 0:
-            volume_change = abs((current_volume - last_volume) / last_volume) * 100
-            logger.debug(f"Изменение объема {symbol}: {volume_change:.2f}%")
-            
-            if volume_change > config.monitoring_config['volume_change_threshold']:
-                if not was_alert_sent(symbol, current_volume):
-                    alert_message = f"📊 Резкое изменение объема {symbol}: {volume_change:.2f}% (${last_volume:,.0f} → ${current_volume:,.0f})"
+                    set_peak_values(symbol, current_price, current_volume, 'price')
+                    logger.info(f"Отправлен WARNING алерт по цене для {symbol}")
+                    
+            elif price_change > 8:  # INFO - рост более 8% от последнего алерта
+                if time_since_last_alert > 600:  # 10 минут
+                    alert_message = f"📈 Рост цены {symbol}: +{price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
                     await send_alert('INFO', alert_message, symbol, {
                         'price': current_price,
                         'volume_24h': current_volume,
-                        'volume_change': volume_change
+                        'price_change': price_change,
+                        'exchange': best_exchange
                     })
-                    logger.debug(f"Отправлен алерт по объему для {symbol}")
+                    set_peak_values(symbol, current_price, current_volume, 'price')
+                    logger.debug(f"Отправлен INFO алерт по цене для {symbol}")
+            
+            # Проверяем падение цены
+            elif price_change < -15:  # WARNING - падение более 15% от последнего алерта
+                if time_since_last_alert > 900:  # 15 минут
+                    alert_message = f"📉 Падение цены {symbol}: {price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
+                    await send_alert('WARNING', alert_message, symbol, {
+                        'price': current_price,
+                        'volume_24h': current_volume,
+                        'price_change': price_change,
+                        'exchange': best_exchange
+                    })
+                    set_peak_values(symbol, current_price, current_volume, 'price')
+                    logger.info(f"Отправлен WARNING алерт по падению цены для {symbol}")
         
-        # Обновляем точку отсчёта
-        set_alert_reference(symbol, current_price, current_volume)
-        logger.debug(f"Обновлена точка отсчёта для {symbol}")
-        
+        # Проверка изменения объема относительно последнего алерта
+        if peak['last_volume_alert'] > 0:
+            volume_change = calculate_relative_change(current_volume, peak['last_volume_alert'])
+            logger.debug(f"Относительное изменение объема {symbol}: {volume_change:.2f}% (от ${peak['last_volume_alert']:,.0f} до ${current_volume:,.0f})")
+            
+            # Валидация изменения объема
+            if abs(volume_change) > 300:  # Подозрительно большое изменение
+                logger.warning(f"Подозрительно большое изменение объема {symbol}: {volume_change:.2f}% - пропускаем алерт")
+                return
+            
+            # Проверяем, прошло ли достаточно времени с последнего алерта
+            time_since_last_alert = current_time - peak['last_alert_time']
+            
+            # Пороги для алертов по объему (относительно последнего алерта)
+            if volume_change > 100:  # WARNING - рост объема более 100% от последнего алерта
+                if time_since_last_alert > 1800:  # 30 минут
+                    alert_message = f"📊🚨 КРИТИЧЕСКИЙ рост объема {symbol}: +{volume_change:.2f}% (${peak['last_volume_alert']:,.0f} → ${current_volume:,.0f})"
+                    await send_alert('WARNING', alert_message, symbol, {
+                        'price': current_price,
+                        'volume_24h': current_volume,
+                        'volume_change': volume_change,
+                        'exchange': best_exchange
+                    })
+                    set_peak_values(symbol, current_price, current_volume, 'volume')
+                    logger.info(f"Отправлен WARNING алерт по объему для {symbol}")
+                    
+            elif volume_change > 60:  # INFO - рост объема более 60% от последнего алерта
+                if time_since_last_alert > 1200:  # 20 минут
+                    alert_message = f"📊 Рост объема {symbol}: +{volume_change:.2f}% (${peak['last_volume_alert']:,.0f} → ${current_volume:,.0f})"
+                    await send_alert('INFO', alert_message, symbol, {
+                        'price': current_price,
+                        'volume_24h': current_volume,
+                        'volume_change': volume_change,
+                        'exchange': best_exchange
+                    })
+                    set_peak_values(symbol, current_price, current_volume, 'volume')
+                    logger.debug(f"Отправлен INFO алерт по объему для {symbol}")
+                    
     except Exception as e:
         logger.error(f"Ошибка проверки алертов для {symbol}: {e}")
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
 
 async def update_fuel_price_realtime():
     """
@@ -2726,6 +4285,57 @@ async def update_arc_price_realtime():
         except Exception as e:
             logger.warning(f"[REALTIME] HTX ARC price error: {e}")
         await asyncio.sleep(5)
+
+# Очистка старых кэшей каждые 2 часа
+async def cleanup_alert_cache():
+    """Очистка старых записей в кэше алертов и БД"""
+    while True:
+        try:
+            current_time = time.time()
+            # Удаляем записи старше 1 часа для более частой очистки
+            expired_keys = [k for k, v in alert_cache.items() if current_time - v > 3600]
+            for key in expired_keys:
+                del alert_cache[key]
+            
+            expired_time_keys = [k for k, v in last_alert_time.items() if current_time - v > 3600]
+            for key in expired_time_keys:
+                del last_alert_time[key]
+                
+            if expired_keys or expired_time_keys:
+                logger.debug(f"Очищен кэш алертов: удалено {len(expired_keys)} + {len(expired_time_keys)} записей")
+            
+            # Очищаем старые алерты из БД (старше 7 дней)
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    with conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            DELETE FROM alerts 
+                            WHERE timestamp < datetime('now', '-7 days')
+                        ''')
+                        deleted_count = cursor.rowcount
+                        if deleted_count > 0:
+                            logger.debug(f"Удалено {deleted_count} старых алертов из БД")
+            except Exception as db_error:
+                logger.error(f"Ошибка очистки БД алертов: {db_error}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка очистки кэша алертов: {e}")
+        
+        await asyncio.sleep(1800)  # 30 минут вместо 2 часов
+
+async def telegram_tokens_loop():
+    """Цикл обновления токенов из Telegram бота"""
+    while True:
+        try:
+            # Обновляем realtime_data токенами из Telegram бота
+            update_realtime_data_with_telegram_tokens()
+            
+            # Ждем 2 минуты перед следующим обновлением
+            await asyncio.sleep(120)
+        except Exception as e:
+            logger.error(f"Ошибка в цикле обновления токенов из Telegram: {e}")
+            await asyncio.sleep(60)
 
 # --- AI/ML Sentiment Analysis ---
 def analyze_sentiment(text: str) -> Dict[str, float]:
@@ -3085,7 +4695,7 @@ async def calculate_risk_score(symbol: str, data: Dict[str, Any]) -> Dict[str, A
             details.append(f"💧 Ликвидность: 20/25 (объем: ${volume_24h:,.0f} - ОЧЕНЬ НИЗКИЙ)")
         elif volume_24h < 1000000:  # < 1M USD
             risk_factors['liquidity'] = 15
-            details.append(f"�� Ликвидность: 15/25 (объем: ${volume_24h:,.0f} - НИЗКИЙ)")
+            details.append(f"💧 Ликвидность: 15/25 (объем: ${volume_24h:,.0f} - НИЗКИЙ)")
         elif volume_24h < 5000000:  # < 5M USD
             risk_factors['liquidity'] = 10
             details.append(f"💧 Ликвидность: 10/25 (объем: ${volume_24h:,.0f} - СРЕДНИЙ)")
@@ -3399,15 +5009,9 @@ async def track_portfolio(portfolio: Dict[str, float]) -> Dict[str, Any]:
                         'percentage_of_portfolio': (current_value / sum(portfolio.values())) * 100 if sum(portfolio.values()) > 0 else 0
                     }
                     
-                    # Алерты на значительные изменения
-                    if abs(price_change_24h) > 10:  # Изменение больше 10%
-                        alert_level = 'CRITICAL' if abs(price_change_24h) > 20 else 'WARNING'
-                        direction = 'рост' if price_change_24h > 0 else 'падение'
-                        await send_alert(
-                            alert_level,
-                            f"Портфель: {symbol} показал {direction} на {abs(price_change_24h):.2f}% за 24ч",
-                            symbol
-                        )
+                    # Алерты на значительные изменения (убрали дублирование)
+                    # Алерты теперь отправляются только в check_portfolio_alerts
+                    pass
         
         # Общие метрики портфеля
         portfolio_metrics = calculate_portfolio_metrics(portfolio)
@@ -3522,6 +5126,141 @@ async def get_portfolio_history(symbol: str, days: int = 7) -> List[Dict[str, An
     except Exception as e:
         logger.error(f"Ошибка получения истории портфеля: {e}")
         return []
+
+def clear_old_portfolio_alerts():
+    """Очищает старые портфельные алерты из базы данных"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # Удаляем старые алерты портфеля
+            cursor.execute('''
+                DELETE FROM alerts 
+                WHERE level IN ('PORTFOLIO_LOSS', 'PORTFOLIO_PROFIT') 
+                OR message LIKE '%ПОРТФОЛИО АЛЕРТ%'
+            ''')
+            deleted_count = cursor.rowcount
+            logger.info(f"Очищено {deleted_count} старых портфельных алертов из БД")
+            
+            # Очищаем кэш портфельных алертов
+            global portfolio_alert_references
+            portfolio_alert_references.clear()
+            logger.info("Очищен кэш портфельных алертов")
+            
+    except Exception as e:
+        logger.error(f"Ошибка очистки старых портфельных алертов: {e}")
+
+# Глобальные переменные для отслеживания портфельных алертов
+portfolio_alert_references = {}  # {symbol: {'last_alert_price': float, 'last_alert_time': int}}
+
+def get_portfolio_alert_reference(symbol: str) -> Optional[Dict[str, Any]]:
+    """Получает последнюю точку отсчета для портфельного алерта"""
+    return portfolio_alert_references.get(symbol)
+
+def set_portfolio_alert_reference(symbol: str, price: float):
+    """Устанавливает новую точку отсчета для портфельного алерта"""
+    portfolio_alert_references[symbol] = {
+        'last_alert_price': price,
+        'last_alert_time': int(time.time())
+    }
+
+async def check_portfolio_alerts(portfolio_data: Dict[str, Any]):
+    """Проверка алертов портфеля с порогом 30% и правильной дедупликацией"""
+    try:
+        total_pnl = portfolio_data.get('total_pnl', 0)
+        total_pnl_percentage = portfolio_data.get('total_pnl_percentage', 0)
+        
+        alerts = []
+        
+        # Алерты по общему PnL (оставляем старые пороги для общего портфеля)
+        if total_pnl_percentage < -10:
+            alerts.append(f"📉 Портфолио в убытке: {total_pnl_percentage:.2f}%")
+        elif total_pnl_percentage > 10:
+            alerts.append(f"📈 Портфолио в прибыли: {total_pnl_percentage:.2f}%")
+        
+        # Алерты по отдельным позициям с новым порогом 30%
+        for symbol, position in portfolio_data.items():
+            if symbol == 'portfolio_metrics':
+                continue
+                
+            if 'price_change_24h' in position:
+                price_change = position['price_change_24h']
+                current_price = position.get('current_price', 0)
+                
+                # Получаем последнюю точку отсчета для этого токена
+                reference = get_portfolio_alert_reference(symbol)
+                
+                if reference and current_price > 0:
+                    last_alert_price = reference['last_alert_price']
+                    last_alert_time = reference['last_alert_time']
+                    current_time = time.time()
+                    
+                    # Вычисляем изменение от последней точки алерта
+                    if last_alert_price > 0:
+                        change_from_last_alert = abs((current_price - last_alert_price) / last_alert_price) * 100
+                        
+                        # Проверяем, прошло ли достаточно времени с последнего алерта (минимум 1 час)
+                        time_since_last_alert = current_time - last_alert_time
+                        
+                        if change_from_last_alert >= 30 and time_since_last_alert >= 3600:  # 30% и 1 час
+                            if price_change > 0:
+                                alert_text = f"🟢 {symbol} вырос на {change_from_last_alert:.1f}% с последнего алерта (текущий рост: {price_change:.1f}%)"
+                                set_portfolio_alert_reference(symbol, current_price)  # Обновляем точку отсчета
+                                alerts.append(alert_text)
+                                logger.info(f"Портфельный алерт: {symbol} вырос на {change_from_last_alert:.1f}%")
+                            else:
+                                alert_text = f"🔴 {symbol} упал на {change_from_last_alert:.1f}% с последнего алерта (текущий убыток: {price_change:.1f}%)"
+                                set_portfolio_alert_reference(symbol, current_price)  # Обновляем точку отсчета
+                                alerts.append(alert_text)
+                                logger.info(f"Портфельный алерт: {symbol} упал на {change_from_last_alert:.1f}%")
+                elif current_price > 0:
+                    # Первый алерт для этого токена - устанавливаем точку отсчета
+                    if abs(price_change) >= 30:  # Только если изменение больше 30%
+                        if price_change > 0:
+                            alert_text = f"🟢 {symbol} вырос на {price_change:.1f}% (первый алерт)"
+                        else:
+                            alert_text = f"🔴 {symbol} упал на {abs(price_change):.1f}% (первый алерт)"
+                        
+                        set_portfolio_alert_reference(symbol, current_price)
+                        alerts.append(alert_text)
+                        logger.info(f"Первый портфельный алерт для {symbol}: {price_change:.1f}%")
+        
+        # Отправляем алерты
+        for alert in alerts:
+            alert_message = f"💼 ПОРТФОЛИО АЛЕРТ: {alert}"
+            await send_alert('INFO', alert_message)
+            logger.info(f"Отправлен алерт портфолио: {alert}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка проверки алертов портфолио: {e}")
+
+async def portfolio_loop():
+    """Бесконечный цикл трекинга портфолио"""
+    logger.info("💼 Запуск трекинга портфолио в цикле...")
+    
+    # Пример портфолио (можно загружать из конфигурации)
+    sample_portfolio = {
+        'FUEL': 1000.0,
+        'ARC': 500.0,
+        'VIRTUAL': 200.0,
+        'BID': 100.0
+    }
+    
+    while True:
+        try:
+            logger.info("💼 Обновление портфолио...")
+            portfolio_summary = await track_portfolio(sample_portfolio)
+            
+            if portfolio_summary:
+                logger.info(f"✅ Портфолио обновлен: ${portfolio_summary.get('total_value', 0):,.2f}")
+                
+                # Проверяем алерты портфолио
+                await check_portfolio_alerts(portfolio_summary)
+            
+            await asyncio.sleep(900)  # Обновляем каждые 15 минут вместо 5
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка в portfolio_loop: {e}")
+            await asyncio.sleep(60)
 
 # --- News Aggregator ---
 async def fetch_crypto_news(symbol: str) -> List[Dict[str, Any]]:
@@ -3913,6 +5652,19 @@ async def send_news_alert(news_data: Dict[str, Any], symbol: str, priority: str 
     except Exception as e:
         logger.error(f"Ошибка отправки алерта о новости: {e}")
 
+async def official_sources_loop():
+    """Бесконечный цикл мониторинга официальных источников"""
+    logger.info("📰 Запуск мониторинга официальных источников в цикле...")
+    while True:
+        try:
+            logger.info("📰 Проверка официальных источников...")
+            await check_official_sources()
+            logger.info("✅ Мониторинг официальных источников завершен")
+            await asyncio.sleep(config.social_config.get('fetch_interval', 900))  # 15 минут
+        except Exception as e:
+            logger.error(f"❌ Ошибка в official_sources_loop: {e}")
+            await asyncio.sleep(60)
+
 async def check_official_sources():
     """Мониторинг только официальных источников токенов"""
     try:
@@ -4170,6 +5922,19 @@ async def check_founders_official(symbol: str, founder_accounts: List[str]):
             
     except Exception as e:
         logger.error(f"Ошибка мониторинга основателей для {symbol}: {e}")
+
+async def news_loop():
+    """Бесконечный цикл мониторинга новостей"""
+    logger.info("📢 Запуск мониторинга новостей в цикле...")
+    while True:
+        try:
+            logger.info("📢 Проверка новостей...")
+            await check_news()
+            logger.info("✅ Мониторинг новостей завершен")
+            await asyncio.sleep(config.social_config.get('fetch_interval', 900))  # 15 минут
+        except Exception as e:
+            logger.error(f"❌ Ошибка в news_loop: {e}")
+            await asyncio.sleep(60)
 
 async def check_news():
     """Основная функция мониторинга новостей (общие источники)"""
@@ -4670,9 +6435,17 @@ async def get_market_overview() -> Dict[str, Any]:
         return {'error': str(e)}
 
 async def onchain_loop(session):
+    """Бесконечный цикл мониторинга on-chain данных"""
+    logger.info("🔄 Запуск onchain мониторинга в цикле...")
     while True:
-        await check_onchain(session)
-        await asyncio.sleep(5)
+        try:
+            logger.info("📊 Проверка on-chain данных...")
+            result = await check_onchain(session)
+            logger.info(f"✅ On-chain данные получены: {result}")
+            await asyncio.sleep(config.monitoring_config['check_interval'])
+        except Exception as e:
+            logger.error(f"❌ Ошибка в onchain_loop: {e}")
+            await asyncio.sleep(30)  # Пауза при ошибке
 
 async def setup_whale_tracking():
     """Настройка Whale Tracker для мониторинга держателей"""
@@ -4737,34 +6510,95 @@ async def main():
         log_error("Инициализация БД", e)
         logger.error("❌ Ошибка инициализации БД")
     
+    # Загрузка пиковых значений из БД
+    try:
+        load_peak_values_from_db()
+        logger.info("✅ Пиковые значения загружены из БД")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка загрузки пиковых значений: {e}")
+    
+    # Очистка старых портфельных алертов
+    try:
+        clear_old_portfolio_alerts()
+        logger.info("✅ Старые портфельные алерты очищены")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка очистки старых портфельных алертов: {e}")
+    
     # Инициализация OpenAI
     try:
         init_openai()
     except Exception as e:
         log_error("Инициализация OpenAI", e)
     
+    # Инициализация новых модулей
+    if NEW_MODULES_AVAILABLE:
+        try:
+            # Инициализация менеджеров
+            performance_monitor = get_performance_monitor()
+            alert_manager = get_alert_manager()
+            recovery_manager = get_recovery_manager()
+            
+            # Регистрация компонентов для восстановления
+            recovery_config = RecoveryConfig(
+                max_retries=3,
+                retry_delay=1.0,
+                strategy=RecoveryStrategy.RETRY
+            )
+            
+            recovery_manager.register_component("onchain_monitor", recovery_config)
+            recovery_manager.register_component("cex_monitor", recovery_config)
+            recovery_manager.register_component("dex_monitor", recovery_config)
+            recovery_manager.register_component("social_monitor", recovery_config)
+            recovery_manager.register_component("analytics_monitor", recovery_config)
+            
+            logger.info("✅ Новые модули инициализированы")
+        except Exception as e:
+            log_error("Инициализация новых модулей", e)
+            logger.warning("⚠️ Новые модули не инициализированы")
+    else:
+        logger.warning("⚠️ Новые модули недоступны")
+    
     logger.info("🚀 Запуск основных задач мониторинга...")
+    
+    # Запуск Telegram бота в отдельном потоке
+    if TELEGRAM_BOT_AVAILABLE:
+        import threading
+        bot = CryptoMonitorBot()
+        bot_thread = threading.Thread(target=bot.run, daemon=True)
+        bot_thread.start()
+        logger.info("🤖 Telegram бот запущен в отдельном потоке")
+    else:
+        logger.warning("⚠️ Telegram бот недоступен - проверьте TELEGRAM_TOKEN в config.env")
     
     try:
         async with aiohttp.ClientSession() as session:
             logger.info("📊 Запуск onchain мониторинга...")
             onchain_task = asyncio.create_task(onchain_loop(session))
             logger.info("🏪 Запуск мониторинга CEX...")
-            cex_task = asyncio.create_task(check_cex(session))
+            cex_task = asyncio.create_task(cex_loop(session))
             logger.info("🔄 Запуск мониторинга DEX...")
-            dex_task = asyncio.create_task(check_dex(session))
+            dex_task = asyncio.create_task(dex_loop(session))
             logger.info("📱 Запуск мониторинга социальных сетей...")
-            social_task = asyncio.create_task(check_social(session))
+            social_task = asyncio.create_task(social_loop(session))
             logger.info("📈 Запуск мониторинга аналитики...")
-            analytics_task = asyncio.create_task(check_analytics(session))
+            analytics_task = asyncio.create_task(analytics_loop(session))
             logger.info("📰 Запуск мониторинга официальных источников...")
-            official_sources_task = asyncio.create_task(check_official_sources())
+            official_sources_task = asyncio.create_task(official_sources_loop())
             logger.info("📢 Запуск мониторинга новостей...")
-            news_task = asyncio.create_task(check_news())
+            news_task = asyncio.create_task(news_loop())
+            logger.info("💼 Запуск трекинга портфолио...")
+            portfolio_task = asyncio.create_task(portfolio_loop())
+            logger.info("🔌 Запуск WebSocket подключений...")
+            websocket_task = asyncio.create_task(start_websocket_connections())
+            logger.info("🧹 Запуск очистки кэша алертов...")
+            cleanup_task = asyncio.create_task(cleanup_alert_cache())
+            logger.info("🤖 Запуск обновления токенов из Telegram...")
+            telegram_tokens_task = asyncio.create_task(telegram_tokens_loop())
             
             await asyncio.gather(
                 onchain_task, cex_task, dex_task, social_task, 
-                analytics_task, official_sources_task, news_task
+                analytics_task, official_sources_task, news_task,
+                portfolio_task, websocket_task, cleanup_task, telegram_tokens_task
             )
     except Exception as e:
         log_error("Главный цикл мониторинга", e)
@@ -4773,32 +6607,32 @@ async def main():
         logger.info("=== Crypto Monitor завершил работу ===")
 
 # --- Работа с точкой отсчёта алерта ---
-def get_alert_reference(symbol: str):
-    """Получает точку отсчёта алерта для токена"""
+def get_alert_reference(reference_key: str):
+    """Получает точку отсчёта алерта для токена и биржи"""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT last_price, last_volume FROM alert_reference WHERE symbol = ?
-            ''', (symbol,))
+                SELECT last_price, last_volume, last_update FROM alert_reference WHERE reference_key = ?
+            ''', (reference_key,))
             row = cursor.fetchone()
             if row:
-                return {'last_price': row[0], 'last_volume': row[1]}
+                return {'last_price': row[0], 'last_volume': row[1], 'last_update': row[2]}
             return None
     except Exception as e:
         logger.error(f"Ошибка получения точки отсчёта алерта: {e}")
         return None
 
-def set_alert_reference(symbol: str, price: float, volume: float):
-    """Устанавливает точку отсчёта алерта для токена"""
+def set_alert_reference(reference_key: str, price: float, volume: float):
+    """Устанавливает точку отсчёта алерта для токена и биржи"""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             with conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT OR REPLACE INTO alert_reference (symbol, last_price, last_volume, last_update)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (symbol, price, volume))
+                    INSERT OR REPLACE INTO alert_reference (reference_key, last_price, last_volume, last_update)
+                    VALUES (?, ?, ?, ?)
+                ''', (reference_key, price, volume, int(time.time())))
     except Exception as e:
         logger.error(f"Ошибка установки точки отсчёта алерта: {e}")
 
@@ -4815,6 +6649,83 @@ def get_token_info(symbol: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Ошибка получения информации о токене {symbol}: {e}")
         return {}
+
+def update_realtime_data_with_telegram_tokens():
+    """Обновляет realtime_data токенами из Telegram бота"""
+    try:
+        if not TELEGRAM_BOT_AVAILABLE:
+            return
+        
+        # Создаем экземпляр DexScreenerMonitor для получения токенов
+        dex_monitor = DexScreenerMonitor()
+        
+        # Получаем все токены всех пользователей
+        all_tokens = []
+        try:
+            # Получаем список всех пользователей из базы данных
+            conn = sqlite3.connect(dex_monitor.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT user_id FROM user_tokens")
+            user_ids = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            
+            # Получаем токены для каждого пользователя
+            for user_id in user_ids:
+                user_tokens = dex_monitor.get_user_tokens(user_id)
+                all_tokens.extend(user_tokens)
+        except Exception as e:
+            logger.error(f"Ошибка получения токенов из базы данных: {e}")
+            return
+        
+        # Обновляем realtime_data для каждого токена
+        for token_data in all_tokens:
+            token_address = token_data['token_address']
+            token_name = token_data.get('token_name', token_address[:8])
+            token_symbol = token_data.get('token_symbol', token_address[:8])
+            
+            # Получаем актуальные данные токена
+            try:
+                token_info = dex_monitor.get_token_info(token_address)
+                if token_info and 'pairs' in token_info and token_info['pairs']:
+                    # Берем первую пару (обычно самая ликвидная)
+                    pair = token_info['pairs'][0]
+                    
+                    # Извлекаем данные
+                    price_usd = float(pair.get('priceUsd', 0))
+                    volume_24h = float(pair.get('volume', {}).get('h24', 0))
+                    price_change_24h = float(pair.get('priceChange', {}).get('h24', 0))
+                    
+                    # Обновляем realtime_data
+                    if token_symbol not in realtime_data:
+                        realtime_data[token_symbol] = {
+                            'price': 0.0,
+                            'volume_24h': 0.0,
+                            'price_change_24h': 0.0,
+                            'last_update': None,
+                            'source': None,
+                            'technical_indicators': {},
+                            'alerts': [],
+                            'token_address': token_address,
+                            'token_name': token_name
+                        }
+                    
+                    realtime_data[token_symbol].update({
+                        'price': price_usd,
+                        'volume_24h': volume_24h,
+                        'price_change_24h': price_change_24h,
+                        'last_update': datetime.now(),
+                        'source': 'DexScreener',
+                        'token_address': token_address,
+                        'token_name': token_name
+                    })
+                    
+                    logger.info(f"Обновлены данные для токена {token_symbol}: цена=${price_usd:.6f}, объем=${volume_24h:.2f}, изменение={price_change_24h:.2f}%")
+                    
+            except Exception as e:
+                logger.error(f"Ошибка обновления данных для токена {token_symbol}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка обновления realtime_data токенами из Telegram: {e}")
 
 # Глобальные переменные для кэширования риск-скоринга
 risk_cache = {}
