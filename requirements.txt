@@ -3,7 +3,6 @@ aiohttp==3.9.1
 requests==2.31.0
 asyncio==3.4.3
 websockets==12.0
-sqlite3
 
 # Конфигурация и переменные окружения
 python-dotenv==1.0.0

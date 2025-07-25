@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Интерактивный Telegram бот для мониторинга криптовалют
+Объединенная версия с функциями отправки алертов из monitor.py
 """
 
 import logging
@@ -18,8 +19,22 @@ from dataclasses import dataclass
 import threading
 import time
 import requests
+import hashlib
+import openai
 
-
+# Импорт новых модулей
+try:
+    from token_manager import get_all_tokens, add_token_to_json, remove_token_from_json
+    from notifier import send_alert, send_price_alert, send_volume_alert
+    from process_manager import process_manager
+    TOKEN_MANAGER_AVAILABLE = True
+    NOTIFIER_AVAILABLE = True
+    PROCESS_MANAGER_AVAILABLE = True
+except ImportError as e:
+    TOKEN_MANAGER_AVAILABLE = False
+    NOTIFIER_AVAILABLE = False
+    PROCESS_MANAGER_AVAILABLE = False
+    print(f"Новые модули недоступны: {e}")
 
 # Загружаем переменные окружения
 load_dotenv('config.env')
@@ -33,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DB_PATH = 'crypto_monitor.db'
 
 # Список токенов для мониторинга
@@ -46,6 +61,10 @@ WAITING_CHECK_INTERVAL = 3
 
 # Хранилище временных данных пользователей
 user_states: Dict[int, Dict[str, Any]] = {}
+
+# Глобальные переменные для кэширования алертов (перенесены из monitor.py)
+alert_cache = {}
+last_alert_time = {}
 
 # Data classes для мониторинга токенов
 @dataclass
@@ -65,7 +84,302 @@ class VolumeData:
     price_change_24h: float
     timestamp: datetime
 
+# ============================================================================
+# ФУНКЦИИ ОТПРАВКИ АЛЕРТОВ (ПЕРЕНЕСЕНЫ ИЗ MONITOR.PY)
+# ============================================================================
 
+async def send_alert_unified(level: str, message: str, token_symbol: str = None, context: Dict[str, Any] = None) -> bool:
+    """
+    Объединенная функция отправки алертов
+    Поддерживает как постоянные токены из monitor.py, так и временные токены
+    """
+    try:
+        logger.debug(f"Подготовка алерта: уровень={level}, токен={token_symbol}")
+        
+        # Проверяем кэш алертов
+        base_message = message.split('\n')[0]
+        alert_hash = hashlib.md5(f"{level}_{token_symbol}_{base_message}".encode()).hexdigest()
+        cache_key = f"alert_{alert_hash}"
+        current_time = time.time()
+        
+        # Проверяем кэш с увеличенным временем блокировки
+        if cache_key in alert_cache:
+            last_time = alert_cache[cache_key]
+            # Увеличиваем время блокировки: 2 часа для INFO, 4 часа для WARNING, 8 часов для ERROR
+            block_time = 7200 if level == 'INFO' else (14400 if level == 'WARNING' else 28800)
+            if current_time - last_time < block_time:
+                logger.debug(f"Алерт заблокирован кэшем: {base_message[:50]}... (блокировка: {block_time//3600}ч)")
+                return False
+        
+        # Формирование сообщения - используем сообщение как есть, без дублирования
+        base_message = message
+        
+        # Отправка в Telegram
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': CHAT_ID,
+            'text': base_message,
+            'parse_mode': 'HTML'
+        }
+        
+        # Логируем сообщение для отладки
+        logger.debug(f"Отправляем сообщение в Telegram: {base_message[:200]}...")
+        logger.info(f"DEBUG: TELEGRAM_TOKEN: {TELEGRAM_TOKEN[:10]}...")
+        logger.info(f"DEBUG: CHAT_ID: {CHAT_ID}")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(telegram_url, json=payload) as response:
+                if response.status == 200:
+                    logger.info(f"✅ Алерт отправлен: {base_message[:100]}...")
+                    alert_cache[cache_key] = current_time
+                    
+                    # Сохраняем алерт в базу данных
+                    try:
+                        import sqlite3
+                        from datetime import datetime
+                        
+                        with sqlite3.connect('crypto_monitor.db') as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('''
+                                INSERT INTO alerts (timestamp, level, message, token_symbol)
+                                VALUES (?, ?, ?, ?)
+                            ''', (
+                                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                level,
+                                base_message,
+                                token_symbol
+                            ))
+                            conn.commit()
+                        logger.debug(f"Алерт сохранен в базу данных: {token_symbol}")
+                    except Exception as e:
+                        logger.error(f"Ошибка сохранения алерта в БД: {e}")
+                    
+                    return True
+                else:
+                    response_text = await response.text()
+                    logger.error(f"Ошибка отправки в Telegram: {response.status} - {response_text}")
+                    return False
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки алерта: {e}")
+        return False
+
+async def send_twitter_alert_to_telegram(tweet_text: str, username: str, token_symbol: str, 
+                                       alert_level: str, link: str, ai_analysis: Dict[str, Any]):
+    """Отправка алерта о твите в Telegram"""
+    try:
+        # Формируем сообщение
+        message = f"🐦 <b>Twitter Alert - {token_symbol}</b>\n"
+        message += f"👤 <b>Автор:</b> @{username}\n"
+        message += f"📝 <b>Текст:</b> {tweet_text[:200]}...\n"
+        
+        if ai_analysis and 'sentiment' in ai_analysis:
+            sentiment = ai_analysis['sentiment']
+            sentiment_emoji = "🟢" if sentiment == "positive" else "🔴" if sentiment == "negative" else "🟡"
+            message += f"{sentiment_emoji} <b>Настроение:</b> {sentiment}\n"
+        
+        if link:
+            message += f"🔗 <a href='{link}'>Читать твит</a>"
+        
+        # Отправляем алерт
+        await send_alert_unified(alert_level, message, token_symbol)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки Twitter алерта: {e}")
+
+async def send_github_alert(message: str, level: str, commit_link: str, repo_info: Dict[str, str]):
+    """Отправка алерта о GitHub коммите"""
+    try:
+        full_message = f"🔧 <b>GitHub Alert</b>\n"
+        full_message += f"📁 <b>Репозиторий:</b> {repo_info['owner']}/{repo_info['repo']}\n"
+        full_message += f"📝 <b>Сообщение:</b> {message}\n"
+        full_message += f"🔗 <a href='{commit_link}'>Просмотр коммита</a>"
+        
+        await send_alert_unified(level, full_message)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки GitHub алерта: {e}")
+
+async def send_social_alert(level: str, source: str, original_text: str, translated_text: str, 
+                          link: str = "", token: str = "", keywords: List[str] = None):
+    """Отправка социального алерта"""
+    try:
+        message = f"📱 <b>Social Alert - {source.upper()}</b>\n"
+        if token:
+            message += f"🪙 <b>Токен:</b> {token}\n"
+        message += f"📝 <b>Текст:</b> {translated_text[:200]}...\n"
+        
+        if keywords:
+            message += f"🏷 <b>Ключевые слова:</b> {', '.join(keywords)}\n"
+        
+        if link:
+            message += f"🔗 <a href='{link}'>Читать далее</a>"
+        
+        await send_alert_unified(level, message, token)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки социального алерта: {e}")
+
+async def send_news_alert(news_data: Dict[str, Any], symbol: str, priority: str = 'medium'):
+    """Отправка алерта о новостях"""
+    try:
+        message = f"📰 <b>News Alert - {symbol}</b>\n"
+        message += f"📋 <b>Заголовок:</b> {news_data.get('title', 'N/A')}\n"
+        message += f"📝 <b>Описание:</b> {news_data.get('description', 'N/A')[:200]}...\n"
+        message += f"🏷 <b>Приоритет:</b> {priority}\n"
+        
+        if news_data.get('url'):
+            message += f"🔗 <a href='{news_data['url']}'>Читать новость</a>"
+        
+        level = 'WARNING' if priority == 'high' else 'INFO'
+        await send_alert_unified(level, message, symbol)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки новостного алерта: {e}")
+
+async def send_official_post_alert(post_data: Dict[str, Any], symbol: str, platform: str, account: str):
+    """Отправка алерта об официальном посте"""
+    try:
+        message = f"📢 <b>Official Post - {symbol}</b>\n"
+        message += f"📱 <b>Платформа:</b> {platform}\n"
+        message += f"👤 <b>Аккаунт:</b> {account}\n"
+        message += f"📝 <b>Содержание:</b> {post_data.get('content', 'N/A')[:200]}...\n"
+        
+        if post_data.get('url'):
+            message += f"🔗 <a href='{post_data['url']}'>Читать пост</a>"
+        
+        await send_alert_unified('WARNING', message, symbol)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки алерта об официальном посте: {e}")
+
+async def send_github_commit_alert(commit_data: Dict[str, Any], symbol: str, owner: str, repo: str):
+    """Отправка алерта о GitHub коммите"""
+    try:
+        message = f"🔧 <b>GitHub Commit - {symbol}</b>\n"
+        message += f"📁 <b>Репозиторий:</b> {owner}/{repo}\n"
+        message += f"👤 <b>Автор:</b> {commit_data.get('commit', {}).get('author', {}).get('name', 'Unknown')}\n"
+        message += f"📝 <b>Сообщение:</b> {commit_data.get('commit', {}).get('message', 'N/A')[:200]}...\n"
+        
+        commit_url = f"https://github.com/{owner}/{repo}/commit/{commit_data.get('sha', '')}"
+        message += f"🔗 <a href='{commit_url}'>Просмотр коммита</a>"
+        
+        await send_alert_unified('INFO', message, symbol)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки алерта о GitHub коммите: {e}")
+
+async def send_discord_server_alert(server_data: Dict[str, Any], symbol: str, invite_code: str):
+    """Отправка алерта о Discord сервере"""
+    try:
+        message = f"🎮 <b>Discord Server - {symbol}</b>\n"
+        message += f"🏠 <b>Сервер:</b> {server_data.get('name', 'N/A')}\n"
+        message += f"👥 <b>Участники:</b> {server_data.get('member_count', 'N/A')}\n"
+        message += f"📝 <b>Описание:</b> {server_data.get('description', 'N/A')[:200]}...\n"
+        
+        if invite_code:
+            invite_url = f"https://discord.gg/{invite_code}"
+            message += f"🔗 <a href='{invite_url}'>Присоединиться</a>"
+        
+        await send_alert_unified('INFO', message, symbol)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки алерта о Discord сервере: {e}")
+
+# Функции кэширования алертов (перенесены из monitor.py)
+def was_recent_alert_sent(symbol: str, alert_type: str, minutes: int = 120) -> bool:
+    """Проверяет, был ли недавно отправлен алерт"""
+    try:
+        cache_key = f"{symbol}_{alert_type}"
+        if cache_key in last_alert_time:
+            last_time = last_alert_time[cache_key]
+            if time.time() - last_time < minutes * 60:
+                return True
+        
+        # Проверяем в БД
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM alerts 
+                WHERE token_symbol = ? AND level = ? 
+                AND timestamp > datetime('now', '-{} minutes')
+            '''.format(minutes), (symbol, alert_type))
+            count = cursor.fetchone()[0]
+            return count > 0
+            
+    except Exception as e:
+        logger.error(f"Ошибка проверки алерта: {e}")
+        return False
+
+def get_token_alert_cooldown(symbol: str) -> int:
+    """Возвращает время блокировки в минутах для токена"""
+    # Специальные правила для проблемных токенов
+    high_volume_tokens = ['BID', 'SAHARA', 'AI16Z', 'URO']
+    if symbol in high_volume_tokens:
+        return 240  # 4 часа
+    return 120  # 2 часа по умолчанию
+
+def should_send_alert(symbol: str, alert_type: str, alert_level: str = 'INFO') -> bool:
+    """Универсальная функция проверки отправки алерта"""
+    try:
+        # Получаем время блокировки для токена
+        cooldown_minutes = get_token_alert_cooldown(symbol)
+        
+        # Проверяем, был ли недавно отправлен алерт
+        if was_recent_alert_sent(symbol, alert_type, cooldown_minutes):
+            logger.debug(f"Алерт заблокирован: {symbol} {alert_type} (блокировка: {cooldown_minutes} мин)")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Ошибка проверки отправки алерта: {e}")
+        return True  # В случае ошибки отправляем алерт
+
+async def cleanup_alert_cache():
+    """Очистка кэша алертов"""
+    while True:
+        try:
+            current_time = time.time()
+            
+            # Очищаем старые записи из кэша
+            expired_keys = []
+            for key, timestamp in alert_cache.items():
+                if current_time - timestamp > 14400:  # 4 часа
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                del alert_cache[key]
+            
+            # Очищаем старые записи из last_alert_time
+            expired_keys = []
+            for key, timestamp in last_alert_time.items():
+                if current_time - timestamp > 14400:  # 4 часа
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                del last_alert_time[key]
+            
+            # Удаляем старые алерты из БД
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    DELETE FROM alerts 
+                    WHERE timestamp < datetime('now', '-4 hours')
+                ''')
+                conn.commit()
+            
+            logger.debug(f"Очистка кэша: удалено {len(expired_keys)} записей")
+            
+        except Exception as e:
+            logger.error(f"Ошибка очистки кэша: {e}")
+        
+        # Ждем 1 час перед следующей очисткой
+        await asyncio.sleep(3600)
+
+# ============================================================================
+# КЛАССЫ ДЛЯ РАБОТЫ С DEXSCREENER
+# ============================================================================
 
 class DexScreenerMonitor:
     """Класс для работы с DexScreener API"""
@@ -159,14 +473,53 @@ class DexScreenerMonitor:
                 
                 if data.get('pairs') and len(data['pairs']) > 0:
                     pair = data['pairs'][0]  # Берем первую пару
+                    
+                    # Валидация цены
+                    price_usd = pair.get('priceUsd', 0)
+                    try:
+                        if isinstance(price_usd, str):
+                            # Убираем лишние символы и проверяем
+                            price_usd = price_usd.strip()
+                            if '/' in price_usd or 'bash' in price_usd.lower():
+                                logger.warning(f"Некорректная цена в DexScreener: {price_usd}")
+                                price_usd = 0
+                        price = float(price_usd) if price_usd else 0
+                    except (ValueError, TypeError):
+                        logger.error(f"Ошибка парсинга цены: {price_usd}")
+                        price = 0
+                    
+                    # Валидация объема
+                    volume_24h = pair.get('volume', {}).get('h24', 0)
+                    try:
+                        volume = float(volume_24h) if volume_24h else 0
+                    except (ValueError, TypeError):
+                        logger.error(f"Ошибка парсинга объема: {volume_24h}")
+                        volume = 0
+                    
+                    # Валидация изменения цены
+                    price_change_24h = pair.get('priceChange', {}).get('h24', 0)
+                    try:
+                        price_change = float(price_change_24h) if price_change_24h else 0
+                    except (ValueError, TypeError):
+                        logger.error(f"Ошибка парсинга изменения цены: {price_change_24h}")
+                        price_change = 0
+                    
+                    # Валидация ликвидности
+                    liquidity_usd = pair.get('liquidity', {}).get('usd', 0)
+                    try:
+                        liquidity = float(liquidity_usd) if liquidity_usd else 0
+                    except (ValueError, TypeError):
+                        logger.error(f"Ошибка парсинга ликвидности: {liquidity_usd}")
+                        liquidity = 0
+                    
                     return {
                         'address': pair.get('tokenAddress'),
                         'name': pair.get('baseToken', {}).get('name'),
                         'symbol': pair.get('baseToken', {}).get('symbol'),
-                        'price': float(pair.get('priceUsd', 0)),
-                        'volume_24h': float(pair.get('volume', {}).get('h24', 0)),
-                        'price_change_24h': float(pair.get('priceChange', {}).get('h24', 0)),
-                        'liquidity': float(pair.get('liquidity', {}).get('usd', 0))
+                        'price': price,
+                        'volume_24h': volume,
+                        'price_change_24h': price_change,
+                        'liquidity': liquidity
                     }
                 else:
                     logger.warning(f"Токен {token_address} не найден в DexScreener или нет торговых пар")
@@ -196,7 +549,32 @@ class DexScreenerMonitor:
                 ''', (user_id, token_address, volume_threshold, price_threshold, check_interval))
                 conn.commit()
             
-            # Сохраняем в JSON
+            # Сохраняем в JSON через token_manager если доступен
+            if TOKEN_MANAGER_AVAILABLE:
+                # Создаем конфигурацию токена для tokens.json
+                token_symbol = token_info.get('symbol', token_address[:10].upper())
+                token_data = {
+                    'symbol': token_symbol,
+                    'name': token_info.get('name', token_symbol),
+                    'chain': token_info.get('chain', 'unknown'),
+                    'contract': token_address,
+                    'decimals': token_info.get('decimals', 18),
+                    'priority': 'medium',
+                    'min_amount_usd': 1000,
+                    'description': f'Token added via Telegram by user {user_id}',
+                    'volume_threshold': volume_threshold,
+                    'price_threshold': price_threshold,
+                    'check_interval': check_interval,
+                    'user_id': user_id
+                }
+                
+                success = add_token_to_json(token_symbol, token_data)
+                if success:
+                    logger.info(f"Токен {token_symbol} добавлен в tokens.json через token_manager")
+                else:
+                    logger.warning(f"Не удалось добавить токен {token_symbol} в tokens.json")
+            
+            # Сохраняем в локальный JSON для обратной совместимости
             if str(user_id) not in self.user_tokens:
                 self.user_tokens[str(user_id)] = []
             
@@ -236,7 +614,24 @@ class DexScreenerMonitor:
                 ''', (user_id, token_address))
                 conn.commit()
             
-            # Удаляем из JSON
+            # Удаляем из tokens.json через token_manager если доступен
+            if TOKEN_MANAGER_AVAILABLE:
+                # Находим символ токена
+                token_symbol = None
+                for token_config in self.user_tokens.get(str(user_id), []):
+                    if token_config['token_address'] == token_address:
+                        token_info = token_config.get('token_info', {})
+                        token_symbol = token_info.get('symbol', token_address[:10].upper())
+                        break
+                
+                if token_symbol:
+                    success = remove_token_from_json(token_symbol)
+                    if success:
+                        logger.info(f"Токен {token_symbol} удален из tokens.json через token_manager")
+                    else:
+                        logger.warning(f"Не удалось удалить токен {token_symbol} из tokens.json")
+            
+            # Удаляем из локального JSON для обратной совместимости
             if str(user_id) in self.user_tokens:
                 self.user_tokens[str(user_id)] = [
                     t for t in self.user_tokens[str(user_id)] 
@@ -501,56 +896,77 @@ class CryptoMonitorBot:
                     alerts = self.dex_monitor.check_volume_changes(int(user_id))
                     for alert in alerts:
                         self.send_alert(int(user_id), alert)
+                
+                # Запускаем очистку кэша алертов в отдельном потоке
+                try:
+                    if hasattr(self, 'loop') and self.loop.is_running():
+                        asyncio.run_coroutine_threadsafe(cleanup_alert_cache(), self.loop)
+                except Exception as cleanup_error:
+                    logger.error(f"Ошибка очистки кэша: {cleanup_error}")
+                
             except Exception as e:
                 logger.error(f"Ошибка фоновой проверки токенов: {e}")
             time.sleep(300)  # 5 минут
 
     def send_alert(self, user_id, alert):
         try:
-            # Создаем уникальный ключ для предотвращения дублирования
-            import time
-            alert_key = f"{alert.get('token_address', '')}:{alert.get('type', '')}:{alert.get('change', 0):.2f}:{int(time.time() / 60)}"
-            
-            # Проверяем, не был ли уже отправлен этот алерт
-            if hasattr(self, '_sent_alerts'):
-                if alert_key in self._sent_alerts:
-                    logger.debug(f"Алерт уже был отправлен: {alert_key}")
-                    return
-            else:
-                self._sent_alerts = set()
-            
-            # Добавляем в отправленные
-            self._sent_alerts.add(alert_key)
-            
-            # Ограничиваем размер множества
-            if len(self._sent_alerts) > 1000:
-                self._sent_alerts.clear()
-            
-            chat_id = user_id  # Можно заменить на отдельный chat_id, если нужно
-            
+            # Получаем символ токена
+            token_symbol = alert.get('token_name', alert.get('token_address', 'UNKNOWN'))
             alert_type = alert.get('type', 'volume')
-            if alert_type == 'volume':
-                text = (
-                    f"📊 <b>Алерт объема!</b>\n"
-                    f"Токен: <code>{alert['token_address']}</code> | {alert['token_name']}\n"
-                    f"Изменение объема: {alert['change']:+.2f}% (порог {alert['threshold']}%)\n"
-                    f"Текущий объем: ${alert['current_volume']:,.0f}\n"
-                    f"Цена: ${alert['current_price']:.6f}"
-                )
-            else:  # price
-                text = (
-                    f"💰 <b>Алерт цены!</b>\n"
-                    f"Токен: <code>{alert['token_address']}</code> | {alert['token_name']}\n"
-                    f"Изменение цены: {alert['change']:+.2f}% (порог {alert['threshold']}%)\n"
-                    f"Текущая цена: ${alert['current_price']:.6f}\n"
-                    f"Объем 24ч: ${alert['current_volume']:,.0f}"
-                )
             
-            if self.updater:
-                self.updater.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
-                logger.info(f"Алерт отправлен: {alert_key}")
+            # Проверяем, нужно ли отправлять алерт через новую систему кэширования
+            if not should_send_alert(token_symbol, alert_type, 'INFO'):
+                logger.debug(f"Алерт заблокирован системой кэширования: {token_symbol} {alert_type}")
+                return
+            
+            # Используем объединенную систему отправки алертов
+            if alert_type == 'volume':
+                # Проверяем корректность данных
+                if alert['current_price'] <= 0 or alert['current_volume'] <= 0:
+                    logger.warning(f"Пропускаем алерт объема с некорректными данными: цена={alert['current_price']}, объем={alert['current_volume']}")
+                    return
+                
+                direction = "🚀" if alert['change'] > 0 else "🔻" if alert['change'] < 0 else "⚪"
+                message = f"{direction}{token_symbol}\n"
+                message += f"Изменение объема: {alert['change']:+.2f}% (порог {alert['threshold']}%)\n"
+                message += f"Текущий объем: ${alert['current_volume']:,.0f}\n"
+                message += f"Цена: ${alert['current_price']:.6f}"
+                
+                context = {
+                    'price': alert['current_price'],
+                    'volume_24h': alert['current_volume'],
+                    'change_percent': alert['change']
+                }
+                
+            else:  # price
+                # Проверяем корректность данных
+                if alert['current_price'] <= 0 or alert['current_volume'] <= 0:
+                    logger.warning(f"Пропускаем алерт с некорректными данными: цена={alert['current_price']}, объем={alert['current_volume']}")
+                    return
+                
+                direction = "🚀" if alert['change'] > 0 else "🔻" if alert['change'] < 0 else "⚪"
+                message = f"{direction}{token_symbol}\n"
+                message += f"Изменение цены: {alert['change']:+.2f}% (порог {alert['threshold']}%)\n"
+                message += f"Текущая цена: ${alert['current_price']:.6f}\n"
+                message += f"Объем 24ч: ${alert['current_volume']:,.0f}"
+                
+                context = {
+                    'price': alert['current_price'],
+                    'volume_24h': alert['current_volume'],
+                    'change_percent': alert['change']
+                }
+            
+            # Отправляем через объединенную систему
+            if hasattr(self, 'loop') and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(send_alert_unified('INFO', message, token_symbol, context), self.loop)
+                logger.info(f"✅ Алерт отправлен: {token_symbol} {alert_type}")
+            else:
+                logger.error("Event loop недоступен для отправки алерта")
+                
         except Exception as e:
             logger.error(f"Ошибка отправки алерта: {e}")
+    
+
     
     def start(self, update: Update, context: CallbackContext):
         """Обработчик команды /start"""
@@ -561,6 +977,7 @@ class CryptoMonitorBot:
             [InlineKeyboardButton("🔍 Детальная аналитика", callback_data="analytics")],
             [InlineKeyboardButton("📊 Рыночная сводка", callback_data="summary")],
             [InlineKeyboardButton("🔗 Мониторинг токенов", callback_data="token_monitor")],
+            [InlineKeyboardButton("🧠 Управление процессами", callback_data="process_control")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -609,6 +1026,8 @@ class CryptoMonitorBot:
                 self.show_summary(query, context)
             elif query.data == "token_monitor":
                 self.show_token_monitor_menu(query, context)
+            elif query.data == "process_control":
+                self.show_process_control(query, context)
             elif query.data == "settings":
                 self.show_settings(query, context)
             elif query.data == "back_to_main":
@@ -651,6 +1070,11 @@ class CryptoMonitorBot:
                 self.handle_threshold_action(query, context)
             elif query.data in ["fast_mode", "eco_mode"]:
                 self.handle_performance_mode(query, context)
+            # Обработка команд управления процессами
+            elif query.data.startswith("process_"):
+                self.handle_process_command(query, context)
+            elif query.data.startswith("script_"):
+                self.handle_script_command(query, context)
             else:
                 logger.warning(f"Неизвестный callback_data: {query.data}")
                 
@@ -676,6 +1100,7 @@ class CryptoMonitorBot:
             [InlineKeyboardButton("🔍 Детальная аналитика", callback_data="analytics")],
             [InlineKeyboardButton("📊 Рыночная сводка", callback_data="summary")],
             [InlineKeyboardButton("🔗 Мониторинг токенов", callback_data="token_monitor")],
+            [InlineKeyboardButton("🧠 Управление процессами", callback_data="process_control")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -704,9 +1129,9 @@ class CryptoMonitorBot:
                     change = data.get('price_change_24h', 0)
                     
                     # Эмодзи для изменения цены
-                    emoji = "🟢" if change > 0 else "🔴" if change < 0 else "⚪"
+                    direction = "🚀" if change > 0 else "🔻" if change < 0 else "⚪"
                     
-                    message += f"{emoji} **{token}**: ${price:.6f}\n"
+                    message += f"{direction} **{token}**: ${price:.6f}\n"
                     message += f"   📊 ${volume:,.0f} | {change:+.2f}%\n\n"
                 else:
                     message += f"⚪ **{token}**: Нет данных\n\n"
@@ -959,7 +1384,8 @@ class CryptoMonitorBot:
             message = f"🔍 **АНАЛИЗ {token}**\n\n"
             message += f"💰 **Цена**: ${price:.6f}\n"
             message += f"📊 **Объем**: ${volume:,.0f}\n"
-            message += f"📈 **Изменение**: {change:+.2f}%\n"
+            direction = "🚀" if change > 0 else "🔻" if change < 0 else "⚪"
+            message += f"{direction} **Изменение**: {change:+.2f}%\n"
             
             if price_history and len(price_history) > 1:
                 prices = [p[0] for p in price_history if p[0] > 0]
@@ -1922,6 +2348,159 @@ class CryptoMonitorBot:
             update.message.reply_text("❌ Неизвестное состояние. Начните заново с /start")
             if user_id in user_states:
                 del user_states[user_id]
+
+    def show_process_control(self, query, context):
+        """Показать меню управления процессами"""
+        logger.info("DEBUG: Функция show_process_control вызвана")
+        if not PROCESS_MANAGER_AVAILABLE:
+            self.safe_edit_message(
+                query,
+                "❌ **Модуль управления процессами недоступен**\n\n"
+                "Убедитесь, что установлен модуль `process_manager`",
+                parse_mode='Markdown'
+            )
+            return
+        
+        try:
+            # Проверяем доступность process_manager
+            logger.info("DEBUG: Проверяем доступность process_manager")
+            if not process_manager:
+                logger.error("DEBUG: process_manager недоступен")
+                self.safe_edit_message(
+                    query,
+                    "❌ **Модуль управления процессами недоступен**\n\n"
+                    "Убедитесь, что установлен модуль `process_manager`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Получаем статус всех процессов
+            logger.info("DEBUG: Вызываем process_manager.get_status()")
+            status = process_manager.get_status()
+            
+            # Отладочная информация
+            logger.info(f"DEBUG: Получен статус от process_manager: {status}")
+            
+            # Формируем сообщение
+            text = "🧠 **Управление процессами**\n\n"
+            text += f"📊 **Статистика:**\n"
+            text += f"• Всего скриптов: {status['summary']['total']}\n"
+            text += f"• Запущено: {status['summary']['running']}\n"
+            text += f"• Остановлено: {status['summary']['stopped']}\n\n"
+            
+            # Формируем кнопки для каждого скрипта
+            keyboard = []
+            for script_name, script_info in status['scripts'].items():
+                status_icon = "🟢" if script_info['running'] else "🔴"
+                status_text = "Запущен" if script_info['running'] else "Остановлен"
+                
+                # Отладочная информация для каждого скрипта
+                logger.info(f"DEBUG: Скрипт {script_name}: running={script_info['running']}, name={script_info['name']}")
+                
+                text += f"{status_icon} **{script_info['name']}**\n"
+                text += f"└ {script_info['description']}\n"
+                text += f"└ Статус: {status_text}\n"
+                
+                if script_info['running'] and script_info['process_info']:
+                    info = script_info['process_info']
+                    text += f"└ PID: {info['pid']} | CPU: {info['cpu_percent']:.1f}% | RAM: {info['memory_mb']:.1f}MB\n"
+                
+                text += "\n"
+                
+                # Кнопки управления для каждого скрипта
+                row = []
+                if script_info['running']:
+                    row.append(InlineKeyboardButton("⏹️ Остановить", callback_data=f"script_stop_{script_name}"))
+                    row.append(InlineKeyboardButton("🔄 Перезапустить", callback_data=f"script_restart_{script_name}"))
+                else:
+                    row.append(InlineKeyboardButton("▶️ Запустить", callback_data=f"script_start_{script_name}"))
+                
+                row.append(InlineKeyboardButton("📋 Логи", callback_data=f"script_logs_{script_name}"))
+                keyboard.append(row)
+            
+            # Добавляем общие кнопки
+            keyboard.append([
+                InlineKeyboardButton("🔄 Обновить", callback_data="process_control"),
+                InlineKeyboardButton("🧹 Очистить", callback_data="process_cleanup")
+            ])
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            self.safe_edit_message(
+                query,
+                text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка показа управления процессами: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            self.safe_edit_message(
+                query,
+                f"❌ **Ошибка:** {str(e)}",
+                parse_mode='Markdown'
+            )
+    
+    def handle_process_command(self, query, context):
+        """Обработка команд управления процессами"""
+        try:
+            command = query.data.split("_")[1]
+            
+            if command == "cleanup":
+                process_manager.cleanup_dead_processes()
+                self.safe_edit_message(query, "✅ Мертвые процессы очищены")
+                # Обновляем меню
+                self.show_process_control(query, context)
+                
+        except Exception as e:
+            logger.error(f"Ошибка обработки команды процесса: {e}")
+            self.safe_edit_message(query, f"❌ Ошибка: {str(e)}")
+    
+    def handle_script_command(self, query, context):
+        """Обработка команд управления скриптами"""
+        try:
+            parts = query.data.split("_")
+            action = parts[1]
+            script_name = parts[2]
+            user_id = query.from_user.id
+            
+            if action == "start":
+                success, message = process_manager.start_script(script_name, user_id)
+                icon = "✅" if success else "❌"
+                self.safe_edit_message(query, f"{icon} {message}")
+                
+            elif action == "stop":
+                success, message = process_manager.stop_script(script_name, user_id)
+                icon = "✅" if success else "❌"
+                self.safe_edit_message(query, f"{icon} {message}")
+                
+            elif action == "restart":
+                success, message = process_manager.restart_script(script_name, user_id)
+                icon = "✅" if success else "❌"
+                self.safe_edit_message(query, f"{icon} {message}")
+                
+            elif action == "logs":
+                logs = process_manager.get_logs(script_name, 20)
+                if len(logs) > 4000:
+                    logs = logs[-4000:] + "\n\n... (показаны последние строки)"
+                
+                self.safe_edit_message(
+                    query,
+                    f"📋 **Логи {script_name}:**\n\n```\n{logs}\n```",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Обновляем меню после выполнения команды
+            time.sleep(1)
+            self.show_process_control(query, context)
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки команды скрипта: {e}")
+            self.safe_edit_message(query, f"❌ Ошибка: {str(e)}")
 
     def run(self):
         """Запустить бота"""

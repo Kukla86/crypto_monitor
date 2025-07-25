@@ -51,6 +51,53 @@ except ImportError:
 alert_cache = {}
 last_alert_time = {}
 
+# Новая система отслеживания последних значений токенов
+last_token_values = {}  # {symbol: {'price': float, 'volume': float, 'timestamp': float}}
+
+def get_last_token_value(symbol: str, value_type: str = 'price') -> Optional[float]:
+    """Получает последнее значение токена (цена или объем)"""
+    if symbol in last_token_values:
+        return last_token_values[symbol].get(value_type)
+    return None
+
+def set_last_token_value(symbol: str, price: float = None, volume: float = None):
+    """Устанавливает последнее значение токена"""
+    if symbol not in last_token_values:
+        last_token_values[symbol] = {}
+    
+    if price is not None:
+        last_token_values[symbol]['price'] = price
+    if volume is not None:
+        last_token_values[symbol]['volume'] = volume
+    
+    last_token_values[symbol]['timestamp'] = time.time()
+
+def calculate_change_from_last(current_value: float, last_value: float) -> float:
+    """Вычисляет процентное изменение от последнего значения"""
+    if last_value is None or last_value == 0:
+        return 0.0
+    return ((current_value - last_value) / last_value) * 100
+
+def should_send_price_alert_from_last(symbol: str, current_price: float, threshold: float = 10.0) -> bool:
+    """Проверяет, нужно ли отправить алерт о изменении цены от последнего значения"""
+    last_price = get_last_token_value(symbol, 'price')
+    if last_price is None:
+        # Первый алерт - всегда отправляем
+        return True
+    
+    change_percent = calculate_change_from_last(current_price, last_price)
+    return abs(change_percent) >= threshold
+
+def should_send_volume_alert_from_last(symbol: str, current_volume: float, threshold: float = 50.0) -> bool:
+    """Проверяет, нужно ли отправить алерт о изменении объема от последнего значения"""
+    last_volume = get_last_token_value(symbol, 'volume')
+    if last_volume is None:
+        # Первый алерт - всегда отправляем
+        return True
+    
+    change_percent = calculate_change_from_last(current_volume, last_volume)
+    return abs(change_percent) >= threshold
+
 # Импорт конфигурации
 from config import get_config
 
@@ -357,13 +404,19 @@ async def analyze_with_chatgpt(prompt: str, analysis_type: str) -> Optional[Dict
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
             
-            response = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=model,
-                messages=messages,
-                max_tokens=1000,
-                temperature=0.7
-            )
+            # Используем ThreadPoolExecutor для Python 3.8
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                response = await loop.run_in_executor(
+                    executor,
+                    lambda: client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        max_tokens=1000,
+                        temperature=0.7
+                    )
+                )
             
             # Преобразуем ответ в старый формат для совместимости
             result = {
@@ -380,13 +433,18 @@ async def analyze_with_chatgpt(prompt: str, analysis_type: str) -> Optional[Dict
         except ImportError:
             # Fallback для старой версии OpenAI
             logger.info("Используем старую версию OpenAI API")
-            response = await asyncio.to_thread(
-                openai.ChatCompletion.create,
-                model=model,
-                messages=messages,
-                max_tokens=1000,
-                temperature=0.7
-            )
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                response = await loop.run_in_executor(
+                    executor,
+                    lambda: openai.ChatCompletion.create(
+                        model=model,
+                        messages=messages,
+                        max_tokens=1000,
+                        temperature=0.7
+                    )
+                )
             
             logger.info("✅ AI анализ успешно завершен (старая версия)")
             return response
@@ -734,20 +792,57 @@ async def websocket_gate_handler():
             reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 async def start_websocket_connections():
-    """Запуск всех WebSocket подключений"""
+    """Запуск всех WebSocket подключений с обработкой ошибок"""
     logger.info("🚀 Запуск WebSocket подключений...")
     
-    # Создаем задачи для каждого WebSocket
-    websocket_tasks = [
-        asyncio.create_task(websocket_bybit_handler()),
-        asyncio.create_task(websocket_okx_handler()),
-        asyncio.create_task(websocket_gate_handler())
-    ]
-    
-    # Запускаем все WebSocket подключения
-    await asyncio.gather(*websocket_tasks, return_exceptions=True)
-    
-    logger.info("✅ WebSocket подключения запущены")
+    while True:
+        try:
+            # Создаем задачи для каждого WebSocket с обработкой ошибок
+            websocket_tasks = []
+            
+            # Bybit WebSocket
+            try:
+                bybit_task = asyncio.create_task(websocket_bybit_handler())
+                websocket_tasks.append(bybit_task)
+            except Exception as e:
+                logger.error(f"Ошибка создания Bybit WebSocket задачи: {e}")
+            
+            # OKX WebSocket
+            try:
+                okx_task = asyncio.create_task(websocket_okx_handler())
+                websocket_tasks.append(okx_task)
+            except Exception as e:
+                logger.error(f"Ошибка создания OKX WebSocket задачи: {e}")
+            
+            # Gate.io WebSocket
+            try:
+                gate_task = asyncio.create_task(websocket_gate_handler())
+                websocket_tasks.append(gate_task)
+            except Exception as e:
+                logger.error(f"Ошибка создания Gate.io WebSocket задачи: {e}")
+            
+            if not websocket_tasks:
+                logger.warning("⚠️ Нет активных WebSocket задач, пропускаем итерацию")
+                await asyncio.sleep(30)
+                continue
+            
+            # Запускаем все WebSocket подключения с обработкой исключений
+            results = await asyncio.gather(*websocket_tasks, return_exceptions=True)
+            
+            # Проверяем результаты на ошибки
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"WebSocket ошибка {i}: {result}")
+            
+            logger.info("✅ WebSocket подключения обработаны")
+            
+            # Небольшая пауза перед следующей итерацией
+            await asyncio.sleep(5)
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка в WebSocket подключениях: {e}")
+            logger.info("🔄 Перезапуск WebSocket подключений через 30 секунд...")
+            await asyncio.sleep(30)
 
 async def save_realtime_data(symbol: str, data: Dict[str, Any], source: str):
     """Сохранение real-time данных в БД"""
@@ -2289,18 +2384,152 @@ async def check_dex(session: aiohttp.ClientSession) -> Dict[str, Any]:
     logger.info("DEX мониторинг завершён")
     return results
 
+async def get_dexscreener_data(symbol: str) -> Optional[Dict[str, Any]]:
+    """Получение данных с DexScreener для конкретного символа"""
+    try:
+        # Получаем контракт для символа из конфигурации
+        token_config = TOKENS.get(symbol)
+        if not token_config:
+            logger.warning(f"Токен {symbol} не найден в конфигурации")
+            return None
+        
+        contract = token_config.get('contract', '')
+        logger.debug(f"Запрос DexScreener для {symbol} (контракт: {contract})")
+        
+        # Создаем сессию для запроса
+        async with aiohttp.ClientSession() as session:
+            # Сначала пробуем поиск по контракту (более точный)
+            if contract:
+                try:
+                    contract_url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+                    async with session.get(contract_url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            logger.debug(f"DexScreener по контракту для {symbol}: {data}")
+                            
+                            if data.get('pairs') and len(data['pairs']) > 0:
+                                # Находим пару с наибольшим объемом
+                                best_pair = max(data['pairs'], key=lambda x: float(x.get('volume', {}).get('h24', 0)))
+                                logger.debug(f"Лучшая пара по контракту для {symbol}: {best_pair}")
+                                
+                                return {
+                                    'price': float(best_pair['priceUsd']),
+                                    'volume_24h': float(best_pair['volume']['h24']),
+                                    'price_change_24h': float(best_pair['priceChange']['h24']),
+                                    'liquidity_usd': float(best_pair['liquidity']['usd'])
+                                }
+                except Exception as e:
+                    logger.warning(f"Ошибка поиска по контракту для {symbol}: {e}")
+            
+            # Если поиск по контракту не удался, пробуем по символу
+            search_url = f"https://api.dexscreener.com/latest/dex/search?q={symbol}"
+            async with session.get(search_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.debug(f"DexScreener поиск для {symbol}: {data}")
+                    
+                    if not data.get('pairs'):
+                        logger.warning(f"DexScreener: нет торговых пар для {symbol}")
+                        return None
+                    
+                    # Находим пару с наибольшим объемом
+                    best_pair = max(data['pairs'], key=lambda x: float(x.get('volume', {}).get('h24', 0)))
+                    logger.debug(f"Лучшая пара по символу для {symbol}: {best_pair}")
+                    
+                    return {
+                        'price': float(best_pair['priceUsd']),
+                        'volume_24h': float(best_pair['volume']['h24']),
+                        'price_change_24h': float(best_pair['priceChange']['h24']),
+                        'liquidity_usd': float(best_pair['liquidity']['usd'])
+                    }
+                else:
+                    logger.warning(f"DexScreener вернул статус {response.status}")
+                    return None
+                    
+    except Exception as e:
+        logger.error(f"Ошибка получения данных DexScreener для {symbol}: {e}")
+        return None
+
 async def check_dexscreener(session: aiohttp.ClientSession, token: Dict) -> Dict[str, Any]:
     """Получение данных с DexScreener"""
     try:
         symbol = token['symbol']
-        logger.debug(f"Запрос DexScreener для {symbol}")
+        chain = token.get('chain', '')
         
-        # Поиск торговых пар
+        # Обработка мультичейн токенов
+        if chain == 'multi':
+            contracts = token.get('contracts', {})
+            logger.debug(f"Мультичейн токен {symbol} с контрактами: {contracts}")
+            
+            # Пробуем контракты в порядке приоритета: BSC, Base, Ethereum
+            contract_priority = ['bsc', 'base', 'ethereum']
+            
+            for chain_name in contract_priority:
+                if chain_name in contracts:
+                    contract = contracts[chain_name]
+                    logger.debug(f"Пробуем контракт {chain_name} для {symbol}: {contract}")
+                    
+                    try:
+                        contract_url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+                        async with session.get(contract_url) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                logger.debug(f"DexScreener по контракту {chain_name} для {symbol}: {data}")
+                                
+                                if data.get('pairs') and len(data['pairs']) > 0:
+                                    # Находим пару с наибольшим объемом
+                                    best_pair = max(data['pairs'], key=lambda x: float(x.get('volume', {}).get('h24', 0)))
+                                    logger.debug(f"Лучшая пара по контракту {chain_name} для {symbol}: {best_pair}")
+                                    
+                                    return {
+                                        'price': float(best_pair['priceUsd']),
+                                        'volume_24h': float(best_pair['volume']['h24']),
+                                        'price_change_24h': float(best_pair['priceChange']['h24']),
+                                        'liquidity_usd': float(best_pair['liquidity']['usd']),
+                                        'chain': chain_name,
+                                        'contract': contract
+                                    }
+                    except Exception as e:
+                        logger.warning(f"Ошибка поиска по контракту {chain_name} для {symbol}: {e}")
+                        continue
+            
+            # Если все контракты не сработали, пробуем поиск по символу
+            logger.debug(f"Все контракты не сработали для {symbol}, пробуем поиск по символу")
+        else:
+            # Обычные токены с одним контрактом
+            contract = token.get('contract', '')
+            logger.debug(f"Запрос DexScreener для {symbol} (контракт: {contract})")
+            
+            # Сначала пробуем поиск по контракту (более точный)
+            if contract:
+                try:
+                    contract_url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+                    async with session.get(contract_url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            logger.debug(f"DexScreener по контракту для {symbol}: {data}")
+                            
+                            if data.get('pairs') and len(data['pairs']) > 0:
+                                # Находим пару с наибольшим объемом
+                                best_pair = max(data['pairs'], key=lambda x: float(x.get('volume', {}).get('h24', 0)))
+                                logger.debug(f"Лучшая пара по контракту для {symbol}: {best_pair}")
+                                
+                                return {
+                                    'price': float(best_pair['priceUsd']),
+                                    'volume_24h': float(best_pair['volume']['h24']),
+                                    'price_change_24h': float(best_pair['priceChange']['h24']),
+                                    'liquidity_usd': float(best_pair['liquidity']['usd']),
+                                    'contract': contract
+                                }
+                except Exception as e:
+                    logger.warning(f"Ошибка поиска по контракту для {symbol}: {e}")
+        
+        # Если поиск по контракту не удался, пробуем по символу
         search_url = f"https://api.dexscreener.com/latest/dex/search?q={symbol}"
         async with session.get(search_url) as response:
             if response.status == 200:
                 data = await response.json()
-                logger.debug(f"DexScreener поиск для {symbol}: {data}")
+                logger.debug(f"DexScreener поиск по символу для {symbol}: {data}")
                 
                 if not data.get('pairs'):
                     logger.warning(f"DexScreener: нет торговых пар для {symbol}")
@@ -2308,7 +2537,7 @@ async def check_dexscreener(session: aiohttp.ClientSession, token: Dict) -> Dict
                 
                 # Находим пару с наибольшим объемом
                 best_pair = max(data['pairs'], key=lambda x: float(x.get('volume', {}).get('h24', 0)))
-                logger.debug(f"Лучшая пара для {symbol}: {best_pair}")
+                logger.debug(f"Лучшая пара по символу для {symbol}: {best_pair}")
                 
                 return {
                     'price': float(best_pair['priceUsd']),
@@ -3101,12 +3330,17 @@ async def analyze_github_changes_with_ai(commit_data: Dict[str, Any], repo_info:
             for file_info in commit_data['files'][:10]:  # Показываем первые 10 файлов
                 files_info += f"- {file_info['filename']} (+{file_info.get('additions', 0)}/-{file_info.get('deletions', 0)})\n"
         
+        # Безопасное извлечение данных коммита
+        author_name = commit_data.get('commit', {}).get('author', {}).get('name', 'Unknown')
+        author_date = commit_data.get('commit', {}).get('author', {}).get('date', 'Unknown')
+        commit_message = commit_data.get('commit', {}).get('message', 'No message')
+        
         context = f"""
         Репозиторий: {repo_info['owner']}/{repo_info['repo']}
         Коммит: {commit_data['sha'][:8]}
-        Автор: {commit_data['commit']['author']['name']}
-        Дата: {commit_data['commit']['author']['date']}
-        Сообщение: {commit_data['commit']['message']}
+        Автор: {author_name}
+        Дата: {author_date}
+        Сообщение: {commit_message}
         
         Статистика изменений:
         - Файлов изменено: {len(commit_data.get('files', []))}
@@ -3747,95 +3981,36 @@ async def get_crypto_news(symbol: str) -> str:
         logger.error(f"Ошибка получения новостей: {e}")
         return f"📊 Мониторинг {symbol} активен"
 
+# Импорт нового модуля notifier
+try:
+    from notifier import send_alert_legacy
+    NOTIFIER_AVAILABLE = True
+except ImportError:
+    NOTIFIER_AVAILABLE = False
+    logger.warning("Модуль notifier недоступен, используем fallback")
+
 @handle_errors("send_alert")
 @performance_decorator("send_alert")
 async def send_alert(level, message, token_symbol=None, context=None):
     """
-    Отправка алерта с использованием нового менеджера алертов
+    Отправка алерта через telegram_bot.py
     """
     try:
         logger.debug(f"Подготовка алерта: уровень={level}, токен={token_symbol}")
         
-        # Используем новый менеджер алертов если доступен
-        if NEW_MODULES_AVAILABLE:
-            # Преобразуем уровень в AlertLevel
-            alert_level_map = {
-                'INFO': AlertLevel.INFO,
-                'WARNING': AlertLevel.WARNING,
-                'ERROR': AlertLevel.ERROR,
-                'CRITICAL': AlertLevel.CRITICAL
-            }
-            
-            alert_level = alert_level_map.get(level, AlertLevel.INFO)
-            
-            # Формирование сообщения
-            if context and 'price' in context and 'volume_24h' in context:
-                message = f"{message}\n💰 Цена: ${context['price']:.6f}\n📊 Объем 24ч: ${context['volume_24h']:,.0f}"
-            
-            # Отправляем через новый менеджер
-            success = await send_alert(
-                level=alert_level,
-                title=f"Алерт {level}",
-                message=message,
-                token_symbol=token_symbol,
-                source="monitor",
-                channels=[AlertChannel.TELEGRAM, AlertChannel.CONSOLE]
-            )
-            
-            if success:
-                logger.info(f"✅ Алерт отправлен через новый менеджер: {message[:100]}...")
-            else:
-                logger.warning(f"⚠️ Не удалось отправить алерт через новый менеджер")
-                
-        else:
-            # Fallback на старую логику
-            logger.debug("Используется fallback логика отправки алертов")
-            
-            # Улучшенная проверка на дублирование алертов
-            base_message = message.split('\n')[0]
-            alert_hash = hashlib.md5(f"{level}_{token_symbol}_{base_message}".encode()).hexdigest()
-            cache_key = f"alert_{alert_hash}"
-            current_time = time.time()
-            
-            # Проверяем кэш
-            if cache_key in alert_cache:
-                last_time = alert_cache[cache_key]
-                block_time = 1800 if level == 'INFO' else (3600 if level == 'WARNING' else 7200)
-                if current_time - last_time < block_time:
-                    logger.debug(f"Алерт заблокирован кэшем: {base_message[:50]}...")
-                    return
-            
-            # Формирование сообщения
-            if context and 'price' in context and 'volume_24h' in context:
-                message = f"{message}\n💰 Цена: ${context['price']:.6f}\n📊 Объем 24ч: ${context['volume_24h']:,.0f}"
-            
-            # Отправка в Telegram
-            telegram_url = f"https://api.telegram.org/bot{config.api_config['telegram']['bot_token']}/sendMessage"
-            payload = {
-                'chat_id': config.api_config['telegram']['chat_id'],
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(telegram_url, json=payload) as response:
-                    if response.status == 200:
-                        logger.info(f"✅ Алерт отправлен: {base_message[:100]}...")
-                        alert_cache[cache_key] = current_time
-                    else:
-                        logger.error(f"Ошибка отправки в Telegram: {response.status}")
-            
-            # Сохранение в БД
-            with sqlite3.connect(DB_PATH) as conn:
-                with conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO alerts (level, message, token_symbol)
-                        VALUES (?, ?, ?)
-                    ''', (level, message, token_symbol))
+        # Импортируем функцию из telegram_bot.py
+        try:
+            from telegram_bot import send_alert_unified
+            return await send_alert_unified(level, message, token_symbol, context)
+        except ImportError:
+            logger.error("Не удалось импортировать send_alert_unified из telegram_bot.py")
+            return False
         
     except Exception as e:
         logger.error(f"Ошибка отправки алерта: {e}")
+        return False
+
+
 
 def save_token_data(symbol: str, data: Dict[str, Any]):
     """Сохраняет данные токена в БД"""
@@ -3960,17 +4135,19 @@ def was_price_alert_sent(symbol: str, price: float, threshold: float = 0.01) -> 
         logger.error(f"Ошибка проверки алерта по цене: {e}")
         return False
 
-def was_recent_alert_sent(symbol: str, alert_type: str, minutes: int = 30) -> bool:
-    """Проверяет, был ли отправлен алерт определенного типа недавно"""
+def was_recent_alert_sent(symbol: str, alert_type: str, minutes: int = 120) -> bool:
+    """Проверяет, был ли отправлен алерт определенного типа недавно (увеличенное время блокировки)"""
     try:
         cache_key = f"{symbol}_{alert_type}"
         current_time = time.time()
         
-        # Проверяем кэш
+        # Проверяем кэш с увеличенным временем блокировки
         if cache_key in last_alert_time:
             last_time = last_alert_time[cache_key]
-            if current_time - last_time < minutes * 60:
-                logger.debug(f"Алерт {alert_type} для {symbol} заблокирован кэшем")
+            # Увеличиваем время блокировки до 2 часов по умолчанию
+            block_time = minutes * 60
+            if current_time - last_time < block_time:
+                logger.debug(f"Алерт {alert_type} для {symbol} заблокирован кэшем (блокировка: {block_time//3600}ч)")
                 return True
         
         # Проверяем БД с более точным запросом
@@ -3994,11 +4171,47 @@ def was_recent_alert_sent(symbol: str, alert_type: str, minutes: int = 30) -> bo
         logger.error(f"Ошибка проверки недавних алертов: {e}")
         return False
 
+def get_token_alert_cooldown(symbol: str) -> int:
+    """Возвращает время блокировки алертов для конкретного токена (в минутах)"""
+    # Специальные правила для токенов с частыми уведомлениями
+    high_frequency_tokens = ['BID', 'SAHARA', 'AI16Z', 'URO']
+    
+    if symbol in high_frequency_tokens:
+        return 240  # 4 часа для токенов с частыми уведомлениями
+    else:
+        return 120  # 2 часа по умолчанию
+
+def should_send_alert(symbol: str, alert_type: str, alert_level: str = 'INFO') -> bool:
+    """Универсальная функция проверки возможности отправки алерта"""
+    try:
+        # Получаем время блокировки для токена
+        cooldown_minutes = get_token_alert_cooldown(symbol)
+        
+        # Проверяем недавние алерты
+        if was_recent_alert_sent(symbol, alert_type, cooldown_minutes):
+            return False
+        
+        # Дополнительная проверка для критических алертов
+        if alert_level == 'ERROR':
+            # Для критических алертов уменьшаем время блокировки
+            critical_cooldown = 60  # 1 час
+            if was_recent_alert_sent(symbol, f"{alert_type}_critical", critical_cooldown):
+                return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка проверки возможности отправки алерта: {e}")
+        return True  # В случае ошибки разрешаем отправку
+
 # --- Изменяем check_alerts ---
 async def check_alerts(symbol: str, data: Dict[str, Any]):
-    """Проверка условий для алертов с новой логикой пиковых значений"""
+    """Проверка условий для алертов с новой логикой отслеживания от последнего значения"""
     try:
         logger.debug(f"Проверка алертов для {symbol}")
+        
+        # Получаем пороги из конфигурации
+        price_threshold = config.monitoring_config['price_change_threshold']  # 10%
+        volume_threshold = config.monitoring_config['volume_change_threshold']  # 50%
         
         # Собираем все доступные данные с указанием источника
         available_data = []
@@ -4106,13 +4319,33 @@ async def check_alerts(symbol: str, data: Dict[str, Any]):
             logger.debug(f"Нет валидных данных для {symbol}")
             return
         
-        # Суммируем объем со всех бирж
-        total_volume = sum(data['volume'] for data in available_data)
+        logger.debug(f"Доступные данные для {symbol}: {len(available_data)} источников")
         
-        # Выбираем цену с биржи, где максимальный объем (как репрезентативную)
-        best_data = max(available_data, key=lambda x: x['volume'])
-        current_price = best_data['price']
-        current_volume = total_volume  # Используем суммарный объем
+        # УЛУЧШЕННЫЙ ВЫБОР ИСТОЧНИКА ДАННЫХ
+        # Приоритизируем надежные биржи
+        reliable_exchanges = ['binance', 'bybit', 'okx', 'gate', 'htx']
+        
+        # Ищем данные с надежных бирж
+        reliable_data = [data for data in available_data if any(exchange in data['source'] for exchange in reliable_exchanges)]
+        
+        if reliable_data:
+            # Используем данные с надежных бирж
+            best_data = max(reliable_data, key=lambda x: x['volume'])
+            current_price = best_data['price']
+            current_volume = sum(data['volume'] for data in reliable_data)  # Суммируем только надежные источники
+            logger.debug(f"Используем данные с надежных бирж для {symbol}: {best_data['source']} = ${current_price}")
+        else:
+            # Fallback на все доступные данные
+            total_volume = sum(data['volume'] for data in available_data)
+            best_data = max(available_data, key=lambda x: x['volume'])
+            current_price = best_data['price']
+            current_volume = total_volume
+            logger.debug(f"Fallback на все источники для {symbol}: {best_data['source']} = ${current_price}")
+        
+        # ДОПОЛНИТЕЛЬНАЯ ВАЛИДАЦИЯ ЦЕНЫ
+        if current_price <= 0 or current_volume <= 0:
+            logger.warning(f"Некорректные данные для {symbol}: цена=${current_price}, объем=${current_volume}")
+            return
         best_exchange = "all_exchanges"  # Указываем, что это суммарные данные
         
         logger.debug(f"Суммарные данные для {symbol}: цена с {best_data['source']} = ${current_price}, общий объем = ${current_volume:,.0f}")
@@ -4125,6 +4358,14 @@ async def check_alerts(symbol: str, data: Dict[str, Any]):
         if peak['last_alert_time'] == 0:
             set_peak_values(symbol, current_price, current_volume)
             logger.debug(f"Инициализированы пиковые значения для {symbol}: цена=${current_price}, объем=${current_volume}")
+            # Устанавливаем начальные значения для алертов
+            set_peak_values(symbol, current_price, current_volume, 'price')
+            set_peak_values(symbol, current_price, current_volume, 'volume')
+            
+            # При первом запуске устанавливаем начальные значения для новой системы алертов
+            set_last_token_value(symbol, current_price, current_volume)
+            logger.info(f"Инициализированы начальные значения для {symbol}: цена=${current_price:.6f}, объем=${current_volume:,.0f}")
+            
             return
         
         # Проверяем, нужно ли обновить пиковые значения
@@ -4132,107 +4373,79 @@ async def check_alerts(symbol: str, data: Dict[str, Any]):
             set_peak_values(symbol, current_price, current_volume)
             logger.debug(f"Обновлены пиковые значения для {symbol}: цена=${current_price}, объем=${current_volume}")
         
-        # Проверка изменения цены относительно последнего алерта
-        if peak['last_price_alert'] > 0:
-            price_change = calculate_relative_change(current_price, peak['last_price_alert'])
-            logger.debug(f"Относительное изменение цены {symbol}: {price_change:.2f}% (от ${peak['last_price_alert']:.6f} до ${current_price:.6f})")
-            
-            # Валидация изменения цены
-            if abs(price_change) > 50:  # Подозрительно большое изменение
-                logger.warning(f"Подозрительно большое изменение цены {symbol}: {price_change:.2f}% - пропускаем алерт")
-                return
-            
-            # Проверяем, прошло ли достаточно времени с последнего алерта
-            time_since_last_alert = current_time - peak['last_alert_time']
-            
-            # Пороги для алертов по цене (относительно последнего алерта)
-            if price_change > 20:  # CRITICAL - рост более 20% от последнего алерта
-                if time_since_last_alert > 1800:  # 30 минут
-                    alert_message = f"🚨🚨 КРИТИЧЕСКИЙ рост цены {symbol}: +{price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
-                    await send_alert('CRITICAL', alert_message, symbol, {
-                        'price': current_price,
-                        'volume_24h': current_volume,
-                        'price_change': price_change,
-                        'exchange': best_exchange
-                    })
-                    set_peak_values(symbol, current_price, current_volume, 'price')
-                    logger.info(f"Отправлен CRITICAL алерт по цене для {symbol}")
-                    
-            elif price_change > 12:  # WARNING - рост более 12% от последнего алерта
-                if time_since_last_alert > 900:  # 15 минут
-                    alert_message = f"🚨 Рост цены {symbol}: +{price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
-                    await send_alert('WARNING', alert_message, symbol, {
-                        'price': current_price,
-                        'volume_24h': current_volume,
-                        'price_change': price_change,
-                        'exchange': best_exchange
-                    })
-                    set_peak_values(symbol, current_price, current_volume, 'price')
-                    logger.info(f"Отправлен WARNING алерт по цене для {symbol}")
-                    
-            elif price_change > 8:  # INFO - рост более 8% от последнего алерта
-                if time_since_last_alert > 600:  # 10 минут
-                    alert_message = f"📈 Рост цены {symbol}: +{price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
-                    await send_alert('INFO', alert_message, symbol, {
-                        'price': current_price,
-                        'volume_24h': current_volume,
-                        'price_change': price_change,
-                        'exchange': best_exchange
-                    })
-                    set_peak_values(symbol, current_price, current_volume, 'price')
-                    logger.debug(f"Отправлен INFO алерт по цене для {symbol}")
-            
-            # Проверяем падение цены
-            elif price_change < -15:  # WARNING - падение более 15% от последнего алерта
-                if time_since_last_alert > 900:  # 15 минут
-                    alert_message = f"📉 Падение цены {symbol}: {price_change:.2f}% (${peak['last_price_alert']:.6f} → ${current_price:.6f})"
-                    await send_alert('WARNING', alert_message, symbol, {
-                        'price': current_price,
-                        'volume_24h': current_volume,
-                        'price_change': price_change,
-                        'exchange': best_exchange
-                    })
-                    set_peak_values(symbol, current_price, current_volume, 'price')
-                    logger.info(f"Отправлен WARNING алерт по падению цены для {symbol}")
+        # НОВАЯ СИСТЕМА АЛЕРТОВ: Отслеживание от последнего значения
         
-        # Проверка изменения объема относительно последнего алерта
-        if peak['last_volume_alert'] > 0:
-            volume_change = calculate_relative_change(current_volume, peak['last_volume_alert'])
-            logger.debug(f"Относительное изменение объема {symbol}: {volume_change:.2f}% (от ${peak['last_volume_alert']:,.0f} до ${current_volume:,.0f})")
+        # Обновляем последние значения токена
+        set_last_token_value(symbol, current_price, current_volume)
+        
+        # Проверяем изменение цены от последнего значения
+        if should_send_price_alert_from_last(symbol, current_price, price_threshold):
+            last_price = get_last_token_value(symbol, 'price')
+            price_change = calculate_change_from_last(current_price, last_price)
             
-            # Валидация изменения объема
-            if abs(volume_change) > 300:  # Подозрительно большое изменение
-                logger.warning(f"Подозрительно большое изменение объема {symbol}: {volume_change:.2f}% - пропускаем алерт")
-                return
+            # Определяем направление изменения
+            if price_change > 0:
+                direction = "🚀"
+                alert_level = "INFO"
+            else:
+                direction = "🔻"
+                alert_level = "WARNING"
             
-            # Проверяем, прошло ли достаточно времени с последнего алерта
-            time_since_last_alert = current_time - peak['last_alert_time']
+            # Формируем сообщение
+            alert_message = f"{direction} {symbol} изменился на {abs(price_change):.2f}% от последнего значения\n"
+            alert_message += f"💰 Текущая цена: ${current_price:.6f}\n"
+            alert_message += f"📊 Объем 24ч: ${current_volume:,.0f}\n"
+            alert_message += f"🏪 Источник: {best_data['source']}"
             
-            # Пороги для алертов по объему (относительно последнего алерта)
-            if volume_change > 100:  # WARNING - рост объема более 100% от последнего алерта
-                if time_since_last_alert > 1800:  # 30 минут
-                    alert_message = f"📊🚨 КРИТИЧЕСКИЙ рост объема {symbol}: +{volume_change:.2f}% (${peak['last_volume_alert']:,.0f} → ${current_volume:,.0f})"
-                    await send_alert('WARNING', alert_message, symbol, {
-                        'price': current_price,
-                        'volume_24h': current_volume,
-                        'volume_change': volume_change,
-                        'exchange': best_exchange
-                    })
-                    set_peak_values(symbol, current_price, current_volume, 'volume')
-                    logger.info(f"Отправлен WARNING алерт по объему для {symbol}")
-                    
-            elif volume_change > 60:  # INFO - рост объема более 60% от последнего алерта
-                if time_since_last_alert > 1200:  # 20 минут
-                    alert_message = f"📊 Рост объема {symbol}: +{volume_change:.2f}% (${peak['last_volume_alert']:,.0f} → ${current_volume:,.0f})"
-                    await send_alert('INFO', alert_message, symbol, {
-                        'price': current_price,
-                        'volume_24h': current_volume,
-                        'volume_change': volume_change,
-                        'exchange': best_exchange
-                    })
-                    set_peak_values(symbol, current_price, current_volume, 'volume')
-                    logger.debug(f"Отправлен INFO алерт по объему для {symbol}")
-                    
+            # Отправляем алерт
+            await send_alert(alert_level, alert_message, symbol, {
+                'price': current_price,
+                'volume_24h': current_volume,
+                'price_change': price_change,
+                'exchange': best_data['source'],
+                'last_price': last_price
+            })
+            
+            # Обновляем последнее значение для следующего сравнения
+            set_last_token_value(symbol, current_price, current_volume)
+            
+            logger.info(f"Отправлен алерт по цене для {symbol}: {price_change:+.2f}% от последнего значения")
+        
+        # Проверяем изменение объема от последнего значения
+        if should_send_volume_alert_from_last(symbol, current_volume, volume_threshold):
+            last_volume = get_last_token_value(symbol, 'volume')
+            volume_change = calculate_change_from_last(current_volume, last_volume)
+            
+            # Определяем направление изменения
+            if volume_change > 0:
+                direction = "🚀"
+                alert_level = "INFO"
+            else:
+                direction = "🔻"
+                alert_level = "WARNING"
+            
+            # Формируем сообщение
+            alert_message = f"{direction} {symbol} объем изменился на {abs(volume_change):.2f}% от последнего значения\n"
+            alert_message += f"📊 Текущий объем: ${current_volume:,.0f}\n"
+            alert_message += f"💰 Цена: ${current_price:.6f}\n"
+            alert_message += f"🏪 Источник: {best_data['source']}"
+            
+            # Отправляем алерт
+            await send_alert(alert_level, alert_message, symbol, {
+                'volume_24h': current_volume,
+                'price': current_price,
+                'volume_change': volume_change,
+                'exchange': best_data['source'],
+                'last_volume': last_volume
+            })
+            
+            # Обновляем последнее значение для следующего сравнения
+            set_last_token_value(symbol, current_price, current_volume)
+            
+            logger.info(f"Отправлен алерт по объему для {symbol}: {volume_change:+.2f}% от последнего значения")
+        
+        logger.debug(f"Проверка алертов завершена для {symbol}")
+        
     except Exception as e:
         logger.error(f"Ошибка проверки алертов для {symbol}: {e}")
         import traceback
@@ -4288,16 +4501,16 @@ async def update_arc_price_realtime():
 
 # Очистка старых кэшей каждые 2 часа
 async def cleanup_alert_cache():
-    """Очистка старых записей в кэше алертов и БД"""
+    """Очистка старых записей в кэше алертов и БД (улучшенная версия)"""
     while True:
         try:
             current_time = time.time()
-            # Удаляем записи старше 1 часа для более частой очистки
-            expired_keys = [k for k, v in alert_cache.items() if current_time - v > 3600]
+            # Удаляем записи старше 4 часов для менее агрессивной очистки
+            expired_keys = [k for k, v in alert_cache.items() if current_time - v > 14400]
             for key in expired_keys:
                 del alert_cache[key]
             
-            expired_time_keys = [k for k, v in last_alert_time.items() if current_time - v > 3600]
+            expired_time_keys = [k for k, v in last_alert_time.items() if current_time - v > 14400]
             for key in expired_time_keys:
                 del last_alert_time[key]
                 
@@ -4322,7 +4535,7 @@ async def cleanup_alert_cache():
         except Exception as e:
             logger.error(f"Ошибка очистки кэша алертов: {e}")
         
-        await asyncio.sleep(1800)  # 30 минут вместо 2 часов
+        await asyncio.sleep(3600)  # 1 час вместо 30 минут
 
 async def telegram_tokens_loop():
     """Цикл обновления токенов из Telegram бота"""
@@ -5203,12 +5416,12 @@ async def check_portfolio_alerts(portfolio_data: Dict[str, Any]):
                         
                         if change_from_last_alert >= 30 and time_since_last_alert >= 3600:  # 30% и 1 час
                             if price_change > 0:
-                                alert_text = f"🟢 {symbol} вырос на {change_from_last_alert:.1f}% с последнего алерта (текущий рост: {price_change:.1f}%)"
+                                alert_text = f"🚀 {symbol} вырос на {change_from_last_alert:.1f}% с последнего алерта (текущий рост: {price_change:.1f}%)"
                                 set_portfolio_alert_reference(symbol, current_price)  # Обновляем точку отсчета
                                 alerts.append(alert_text)
                                 logger.info(f"Портфельный алерт: {symbol} вырос на {change_from_last_alert:.1f}%")
                             else:
-                                alert_text = f"🔴 {symbol} упал на {change_from_last_alert:.1f}% с последнего алерта (текущий убыток: {price_change:.1f}%)"
+                                alert_text = f"🔻 {symbol} упал на {change_from_last_alert:.1f}% с последнего алерта (текущий убыток: {price_change:.1f}%)"
                                 set_portfolio_alert_reference(symbol, current_price)  # Обновляем точку отсчета
                                 alerts.append(alert_text)
                                 logger.info(f"Портфельный алерт: {symbol} упал на {change_from_last_alert:.1f}%")
@@ -5216,9 +5429,9 @@ async def check_portfolio_alerts(portfolio_data: Dict[str, Any]):
                     # Первый алерт для этого токена - устанавливаем точку отсчета
                     if abs(price_change) >= 30:  # Только если изменение больше 30%
                         if price_change > 0:
-                            alert_text = f"🟢 {symbol} вырос на {price_change:.1f}% (первый алерт)"
+                            alert_text = f"🚀 {symbol} вырос на {price_change:.1f}% (первый алерт)"
                         else:
-                            alert_text = f"🔴 {symbol} упал на {abs(price_change):.1f}% (первый алерт)"
+                            alert_text = f"🔻 {symbol} упал на {abs(price_change):.1f}% (первый алерт)"
                         
                         set_portfolio_alert_reference(symbol, current_price)
                         alerts.append(alert_text)
@@ -6578,15 +6791,9 @@ async def main():
     
     logger.info("🚀 Запуск основных задач мониторинга...")
     
-    # Запуск Telegram бота в отдельном потоке
-    if TELEGRAM_BOT_AVAILABLE:
-        import threading
-        bot = CryptoMonitorBot()
-        bot_thread = threading.Thread(target=bot.run, daemon=True)
-        bot_thread.start()
-        logger.info("🤖 Telegram бот запущен в отдельном потоке")
-    else:
-        logger.warning("⚠️ Telegram бот недоступен - проверьте TELEGRAM_TOKEN в config.env")
+    # Telegram бот теперь запускается отдельно через telegram_bot.py
+    # Отключаем запуск бота здесь для избежания конфликтов
+    logger.info("🤖 Telegram бот запускается отдельно через telegram_bot.py")
     
     try:
         async with aiohttp.ClientSession() as session:

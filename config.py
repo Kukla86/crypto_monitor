@@ -68,11 +68,11 @@ class Config:
     def _load_monitoring_config(self):
         """Загрузка конфигурации мониторинга"""
         self.monitoring_config = {
-            'check_interval': int(os.getenv('CHECK_INTERVAL', '60')),
+            'check_interval': int(os.getenv('CHECK_INTERVAL', '300')),  # 5 минут вместо 60 секунд
             'top_holders_count': int(os.getenv('TOP_HOLDERS_COUNT', '10')),
             'notification_threshold': float(os.getenv('NOTIFICATION_THRESHOLD', '500000')),
-            'price_change_threshold': float(os.getenv('PRICE_CHANGE_THRESHOLD', '15')),
-            'volume_change_threshold': float(os.getenv('VOLUME_CHANGE_THRESHOLD', '100')),
+            'price_change_threshold': float(os.getenv('PRICE_CHANGE_THRESHOLD', '10')),  # 10% от последнего значения
+            'volume_change_threshold': float(os.getenv('VOLUME_CHANGE_THRESHOLD', '50')),  # 50% от последнего значения
             'tvl_change_threshold': float(os.getenv('TVL_CHANGE_THRESHOLD', '20')),
             'holders_change_threshold': int(os.getenv('HOLDERS_CHANGE_THRESHOLD', '5')),
             'websocket_enabled': os.getenv('WEBSOCKET_ENABLED', 'true').lower() == 'true',
@@ -217,114 +217,13 @@ class Config:
             raise ValueError(f"Неверный уровень логирования: {self.logging_config['level']}")
     
     def get_tokens_config(self) -> Dict[str, Any]:
-        """Получение конфигурации токенов"""
-        return {
-            'FUEL': {
-                'symbol': 'FUEL',
-                'name': 'Fuel',
-                'chain': 'ethereum',
-                'contract': '0x675b68aa4d9c2d3bb3f0397048e62e6b7192079c',
-                'decimals': 18,
-                'priority': 'high',
-                'min_amount_usd': 500000
-            },
-            'ARC': {
-                'symbol': 'ARC',
-                'name': 'ARC',
-                'chain': 'solana',
-                'contract': '61V8vBaqAGMpgDQi4JcAwo1dmBGHsyhzodcPqnEVpump',
-                'decimals': 9,
-                'priority': 'high',
-                'min_amount_usd': 500000
-            },
-            'URO': {
-                'symbol': 'URO',
-                'name': 'Urolithin A',
-                'chain': 'solana',
-                'contract': 'FvgqHMfL9yn39V79huDPy3YUNDoYJpuLWng2JfmQpump',
-                'decimals': 9,
-                'priority': 'high',
-                'min_amount_usd': 500000,
-                'exchanges': ['htx', 'bitmart', 'gate', 'mexc', 'ascendex', 'bingx', 'raydium']
-            },
-            'XION': {
-                'symbol': 'XION',
-                'name': 'XION',
-                'chain': 'xion',
-                'contract': 'native',
-                'decimals': 6,
-                'priority': 'high',
-                'min_amount_usd': 500000,
-                'exchanges': ['htx', 'lbank', 'gate', 'bitget', 'bybit', 'mexc', 'kucoin']
-            },
-            'AI16Z': {
-                'symbol': 'AI16Z',
-                'name': 'AI16Z',
-                'chain': 'solana',
-                'contract': 'HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC',
-                'decimals': 9,
-                'priority': 'high',
-                'min_amount_usd': 500000
-            },
-            'SAHARA': {
-                'symbol': 'SAHARA',
-                'name': 'Sahara AI',
-                'chain': 'ethereum',
-                'contract': '0xfdffb411c4a70aa7c95d5c981a6fb4da867e1111',
-                'decimals': 18,
-                'priority': 'high',
-                'min_amount_usd': 500000,
-                'exchanges': ['binance', 'okx', 'bybit', 'gate', 'upbit', 'mexc']
-            },
-            'VIRTUAL': {
-                'symbol': 'VIRTUAL',
-                'name': 'Virtuals Protocol',
-                'chain': 'multi',
-                'contracts': {
-                    'ethereum': '0x44ff8620b8ca30902395a7bd3f2407e1a091bf73',
-                    'solana': '3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y',
-                    'base': '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b'
-                },
-                'decimals': 18,
-                'priority': 'high',
-                'min_amount_usd': 500000
-            },
-            'BID': {
-                'symbol': 'BID',
-                'name': 'CreatorBid',
-                'chain': 'multi',
-                'contracts': {
-                    'bsc': '0xa1832f7f4e534ae557f9b5ab76de54b1873e498b',
-                    'base': '0xa1832f7f4e534ae557f9b5ab76de54b1873e498b'
-                },
-                'decimals': 18,
-                'priority': 'high',
-                'min_amount_usd': 100000
-            },
-            'MANTA': {
-                'symbol': 'MANTA',
-                'name': 'Manta Network',
-                'chain': 'ethereum',
-                'contract': '0x95cef13441be50d20ca4558cc0a27b601ac544e5',
-                'decimals': 18,
-                'priority': 'high',
-                'min_amount_usd': 500000,
-                'exchanges': ['binance', 'okx', 'bybit', 'gate', 'mexc']
-            },
-            'ANON': {
-                'symbol': 'ANON',
-                'name': 'Hey Anon',
-                'chain': 'multi',
-                'contracts': {
-                    'ethereum': '0x79bbf4508b1391af3a0f4b30bb5fc4aa9ab0e07c',
-                    'solana': '9McvH6w97oewLmPxqQEoHUAv3u5iYMyQ9AeZZhguYf1T'
-                },
-                'decimals': 18,
-                'priority': 'high',
-                'min_amount_usd': 500000,
-                'exchanges': ['gate', 'aerodrome', 'bitunix', 'raydium', 'kraken']
-            }
-        }
+        """Получение конфигурации токенов из token_manager"""
+        try:
+            from token_manager import get_all_tokens
+            return get_all_tokens()
+        except ImportError:
+            logger.warning("token_manager не найден, возвращаем пустой словарь")
+            return {}
     
     def is_production(self) -> bool:
         """Проверка, является ли окружение продакшн"""
